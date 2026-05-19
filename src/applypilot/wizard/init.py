@@ -101,7 +101,6 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
     # -- Work Authorization --
@@ -113,27 +112,35 @@ def _setup_profile() -> dict:
     }
 
     # -- Compensation --
-    console.print("\n[bold cyan]Compensation[/bold cyan]")
+    console.print("\n[bold cyan]Compensation & Work Preference[/bold cyan]")
     salary = Prompt.ask("Expected annual salary (number)", default="")
     salary_currency = Prompt.ask("Currency", default="USD")
     salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
     range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
+    remote_pref = Prompt.ask(
+        "Remote preference",
+        choices=["Remote Only", "Hybrid", "Onsite", "Open"],
+        default="Open",
+    )
     profile["compensation"] = {
         "salary_expectation": salary,
         "salary_currency": salary_currency,
         "salary_range_min": range_parts[0].strip(),
         "salary_range_max": range_parts[1].strip() if len(range_parts) > 1 else range_parts[0].strip(),
+        "remote_preference": remote_pref,
     }
 
     # -- Experience --
     console.print("\n[bold cyan]Experience[/bold cyan]")
     current_title = Prompt.ask("Current/most recent job title", default="")
     target_role = Prompt.ask("Target role (what you're applying for, e.g. 'Senior Backend Engineer')", default=current_title)
+    is_manager = Confirm.ask("Do you have management experience?", default=False)
     profile["experience"] = {
         "years_of_experience_total": Prompt.ask("Years of professional experience", default=""),
         "education_level": Prompt.ask("Highest education (e.g. Bachelor's, Master's, PhD, Self-taught)", default=""),
         "current_title": current_title,
         "target_role": target_role,
+        "management_experience": is_manager,
     }
 
     # -- Skills Boundary --
@@ -181,62 +188,13 @@ def _setup_profile() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Search config
-# ---------------------------------------------------------------------------
-
-def _setup_searches() -> None:
-    """Generate a searches.yaml from user input."""
-    console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for."))
-
-    location = Prompt.ask("Target location (e.g. 'Remote', 'Canada', 'New York, NY')", default="Remote")
-    distance_str = Prompt.ask("Search radius in miles (0 for remote-only)", default="0")
-    try:
-        distance = int(distance_str)
-    except ValueError:
-        distance = 0
-
-    roles_raw = Prompt.ask(
-        "Target job titles (comma-separated, e.g. 'Backend Engineer, Full Stack Developer')"
-    )
-    roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
-
-    if not roles:
-        console.print("[yellow]No roles provided. Using a default set.[/yellow]")
-        roles = ["Software Engineer"]
-
-    # Build YAML content
-    lines = [
-        "# ApplyPilot search configuration",
-        "# Edit this file to refine your job search queries.",
-        "",
-        "defaults:",
-        f'  location: "{location}"',
-        f"  distance: {distance}",
-        "  hours_old: 72",
-        "  results_per_site: 50",
-        "",
-        "locations:",
-        f'  - location: "{location}"',
-        f"    remote: {str(distance == 0).lower()}",
-        "",
-        "queries:",
-    ]
-    for i, role in enumerate(roles):
-        lines.append(f'  - query: "{role}"')
-        lines.append(f"    tier: {min(i + 1, 3)}")
-
-    SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    console.print(f"[green]Search config saved to {SEARCH_CONFIG_PATH}[/green]")
-
-
-# ---------------------------------------------------------------------------
 # AI Features
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
     """Ask about AI scoring/tailoring — optional LLM configuration."""
     console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
+        "[bold]Step 3: AI Features (optional)[/bold]\n"
         "An LLM powers job scoring, resume tailoring, and cover letters.\n"
         "Without this, you can still discover and enrich jobs."
     ))
@@ -256,7 +214,7 @@ def _setup_ai_features() -> None:
 
     if provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-2.0-flash")
+        model = Prompt.ask("Model", default="gemini-flash-latest")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
@@ -282,7 +240,7 @@ def _setup_ai_features() -> None:
 def _setup_auto_apply() -> None:
     """Configure autonomous job application (requires Claude Code CLI)."""
     console.print(Panel(
-        "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
+        "[bold]Step 4: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
         "using Claude Code as the browser agent."
     ))
@@ -329,7 +287,7 @@ def run_wizard() -> None:
     console.print()
     console.print(
         Panel.fit(
-            "[bold green]ApplyPilot Setup Wizard[/bold green]\n\n"
+            "[bold green]ApplyPilot Setup Wizard (Greenhouse Only)[/bold green]\n\n"
             "This will create your configuration at:\n"
             f"  [cyan]{APP_DIR}[/cyan]\n\n"
             "You can re-run this anytime with [bold]applypilot init[/bold].",
@@ -348,15 +306,11 @@ def run_wizard() -> None:
     _setup_profile()
     console.print()
 
-    # Step 3: Search config
-    _setup_searches()
-    console.print()
-
-    # Step 4: AI features (optional LLM)
+    # Step 3: AI features (optional LLM)
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 4: Auto-apply (Claude Code detection)
     _setup_auto_apply()
     console.print()
 

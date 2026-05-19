@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 import httpx
 import yaml
@@ -739,7 +739,11 @@ def execute_json_ld(intel: dict, plan: dict) -> list[dict]:
             if not path or path == "null":
                 job[field] = None
                 continue
-            job[field] = resolve_json_path(entry, path)
+            val = resolve_json_path(entry, path)
+            if field == "url" and val:
+                job[field] = urljoin(intel.get("url", ""), val)
+            else:
+                job[field] = val
         jobs.append(job)
     return jobs
 
@@ -775,7 +779,11 @@ def execute_api_response(intel: dict, plan: dict) -> list[dict]:
             if not path or path == "null":
                 job[field] = None
                 continue
-            job[field] = resolve_json_path(item, path)
+            val = resolve_json_path(item, path)
+            if field == "url" and val:
+                job[field] = urljoin(intel.get("url", ""), val)
+            else:
+                job[field] = val
         jobs.append(job)
     return jobs
 
@@ -838,7 +846,11 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
                 job[field] = None
                 continue
             if el:
-                job[field] = el.get("href") if field == "url" else el.get_text(strip=True)
+                if field == "url":
+                    val = el.get("href")
+                    job[field] = urljoin(intel.get("url", ""), val) if val else None
+                else:
+                    job[field] = el.get_text(strip=True)
             else:
                 job[field] = None
         jobs.append(job)

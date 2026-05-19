@@ -2,7 +2,7 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
+  GEMINI_API_KEY  -> Google Gemini (default: gemini-flash-latest)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
@@ -170,9 +170,9 @@ class LLMClient:
             headers=headers,
         )
 
-        # 403 on Gemini compat = model not available on compat layer.
+        # 403 or 404 on Gemini compat = model not available on compat layer.
         # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
+        if resp.status_code in (403, 404) and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
         return self._handle_compat_response(resp)
@@ -210,9 +210,10 @@ class LLMClient:
             except _GeminiCompatForbidden as exc:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
+                    "Gemini compat endpoint returned %s for model '%s'. "
                     "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
+                    "(Preview/experimental models are often native-only.)",
+                    exc.response.status_code,
                     self.model,
                 )
                 self._use_native_gemini = True

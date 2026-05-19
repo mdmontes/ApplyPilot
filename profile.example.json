@@ -16,35 +16,33 @@
     "website_url": ""
   },
   "work_authorization": {
-    "legally_authorized_to_work": "Yes",
-    "require_sponsorship": "No",
-    "work_permit_type": ""
+    "legally_authorized_to_work": true,
+    "require_sponsorship": false,
+    "work_permit_type": "Citizen"
   },
   "availability": {
     "earliest_start_date": "Immediately",
-    "available_for_full_time": "Yes",
-    "available_for_contract": "No"
+    "available_for_full_time": true,
+    "available_for_contract": false
   },
   "compensation": {
     "salary_expectation": "85000",
     "salary_currency": "USD",
     "salary_range_min": "80000",
     "salary_range_max": "100000",
-    "currency_conversion_note": ""
+    "remote_preference": "Open"
   },
   "experience": {
     "years_of_experience_total": "3",
     "education_level": "Bachelor's Degree",
-    "current_job_title": "",
-    "current_company": "",
-    "target_role": "software engineer"
+    "current_title": "Software Engineer",
+    "target_role": "Senior Software Engineer",
+    "management_experience": false
   },
   "skills_boundary": {
-    "languages": ["Python", "SQL", "JavaScript"],
+    "programming_languages": ["Python", "SQL", "JavaScript"],
     "frameworks": ["FastAPI", "Flask", "React"],
-    "devops": ["Docker", "AWS", "CI/CD"],
-    "databases": ["PostgreSQL", "MongoDB"],
-    "tools": ["Git", "Linux"]
+    "tools": ["Docker", "AWS", "Git"]
   },
   "resume_facts": {
     "preserved_companies": ["Company A", "Company B"],
@@ -55,7 +53,7 @@
   "eeo_voluntary": {
     "gender": "Decline to self-identify",
     "race_ethnicity": "Decline to self-identify",
-    "veteran_status": "I am not a protected veteran",
-    "disability_status": "I do not wish to answer"
+    "veteran_status": "Decline to self-identify",
+    "disability_status": "Decline to self-identify"
   }
 }

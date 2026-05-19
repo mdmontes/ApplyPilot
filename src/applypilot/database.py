@@ -279,48 +279,23 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
 
-    # Tailoring stage
-    stats["tailored"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL"
-    ).fetchone()[0]
-
-    stats["untailored_eligible"] = conn.execute(
+    # Ready to apply
+    stats["ready_to_apply"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
+        "WHERE fit_score >= 7 "
+        "AND applied_at IS NULL "
+        "AND application_url IS NOT NULL"
     ).fetchone()[0]
 
-    stats["tailor_exhausted"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE COALESCE(tailor_attempts, 0) >= 5 "
-        "AND tailored_resume_path IS NULL"
-    ).fetchone()[0]
-
-    # Cover letter stage
-    stats["with_cover_letter"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL"
-    ).fetchone()[0]
-
-    stats["cover_exhausted"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE COALESCE(cover_attempts, 0) >= 5 "
-        "AND (cover_letter_path IS NULL OR cover_letter_path = '')"
-    ).fetchone()[0]
-
-    # Application stage
+    # Streamlining: Placeholder stats for removed stages to keep CLI happy
+    stats["tailored"] = 0
+    stats["untailored_eligible"] = 0
+    stats["with_cover_letter"] = 0
     stats["applied"] = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL"
     ).fetchone()[0]
-
     stats["apply_errors"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
-    ).fetchone()[0]
-
-    stats["ready_to_apply"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE tailored_resume_path IS NOT NULL "
-        "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'failed'"
     ).fetchone()[0]
 
     return stats
@@ -392,7 +367,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
-            "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
+            "fit_score >= ? AND applied_at IS NULL "
             "AND application_url IS NOT NULL"
         ),
         "applied": "applied_at IS NOT NULL",
