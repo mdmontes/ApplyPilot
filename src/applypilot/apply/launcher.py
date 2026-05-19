@@ -20,11 +20,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+from playwright.sync_api import sync_playwright
 from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
+from applypilot.llm import get_client
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -38,20 +40,11 @@ from applypilot.apply.dashboard import (
 
 logger = logging.getLogger(__name__)
 
-# Blocked sites loaded from config/sites.yaml
-def _load_blocked():
-    from applypilot.config import load_blocked_sites
-    return load_blocked_sites()
-
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
-
-# Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
-_claude_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -74,11 +67,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
+            }
         }
     }
 
@@ -106,40 +95,25 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT url, title, site, application_url,
+                       fit_score, location, full_description
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+            # Simple acquisition for Greenhouse jobs
+            row = conn.execute("""
+                SELECT url, title, site, application_url,
+                       fit_score, location, full_description
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
+                WHERE (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
-                  {site_clause}
-                  {url_clauses}
                 ORDER BY fit_score DESC, url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"], min_score]).fetchone()
 
         if not row:
             conn.rollback()
@@ -221,14 +195,8 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if not job:
         return None
 
-    # Read resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    # Generate prompt
+    prompt = prompt_mod.build_prompt(job=job)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -291,228 +259,184 @@ def reset_failed() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Per-job execution (Gemini Engine)
+# ---------------------------------------------------------------------------
+
+def extract_form_structure(page) -> str:
+    """Extract visible form fields and their associated labels/IDs."""
+    fields = page.evaluate("""() => {
+        const results = [];
+        const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
+        
+        inputs.forEach(input => {
+            // Skip hidden or non-functional inputs
+            const style = window.getComputedStyle(input);
+            if (input.type === 'hidden' || style.display === 'none' || style.visibility === 'hidden') return;
+            if (input.type === 'submit' || input.type === 'button') return;
+
+            let labelText = '';
+            // 1. Label by 'for'
+            if (input.id) {
+                const label = document.querySelector(`label[for="${input.id}"]`);
+                if (label) labelText = label.innerText;
+            }
+            // 2. Parent label
+            if (!labelText) {
+                const parentLabel = input.closest('label');
+                if (parentLabel) labelText = parentLabel.innerText;
+            }
+            // 3. Aria-label or Placeholder
+            if (!labelText) labelText = input.getAttribute('aria-label') || input.placeholder || '';
+
+            results.push({
+                id: input.id || '',
+                name: input.name || '',
+                type: input.tagName.toLowerCase() === 'input' ? input.type : input.tagName.toLowerCase(),
+                label: labelText.replace(/\\n/g, ' ').trim(),
+                required: input.required || input.getAttribute('aria-required') === 'true'
+            });
+        });
+        return results;
+    }""")
+    
+    lines = []
+    for f in fields:
+        req = " (REQUIRED)" if f['required'] else ""
+        lines.append(f"- {f['label']}{req} | ID: {f['id']} | Type: {f['type']}")
+    
+    return "\n".join(lines)
+
+
+def run_job_gemini(job: dict, port: int, worker_id: int = 0,
+                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int]:
+    """Execute a one-shot job application using Gemini + Playwright."""
+    start = time.time()
+    update_state(worker_id, status="applying", job_title=job["title"],
+                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 start_time=start, actions=0, last_action="navigating")
+    add_event(f"[W{worker_id}] Starting (Gemini): {job['title'][:40]} @ {job.get('site', '')}")
+
+    url = job.get("application_url") or job["url"]
+    
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://localhost:{port}")
+            context = browser.contexts[0]
+            page = context.new_page()
+            
+            # 1. Navigate
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            update_state(worker_id, last_action="extracting form", actions=1)
+            
+            # 2. Extract Structure
+            form_text = extract_form_structure(page)
+            
+            # 3. Ask Gemini
+            prompt = prompt_mod.build_gemini_fill_prompt(job, form_text)
+            llm = get_client()
+            response = llm.ask(prompt)
+            
+            # Clean up JSON response (it might have markdown blocks)
+            json_str = response.strip()
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+            field_map = json.loads(json_str)
+            
+            # 4. Fill Form
+            update_state(worker_id, last_action="filling form", actions=2)
+            for fid, value in field_map.items():
+                if not fid: continue
+                
+                if value == "PDF_RESUME_UPLOAD":
+                    # Handle resume upload
+                    if config.RESUME_PDF_PATH.exists():
+                        try:
+                            page.set_input_files(f"#{fid}", str(config.RESUME_PDF_PATH))
+                        except Exception as e:
+                            add_event(f"[W{worker_id}] Upload error on {fid}: {str(e)[:40]}")
+                    continue
+                
+                # Try to fill based on type
+                selector = f'[id="{fid}"]'
+                el = page.query_selector(selector)
+                if not el: continue
+                
+                try:
+                    el.scroll_into_view_if_needed()
+                    tag = el.evaluate("e => e.tagName.toLowerCase()")
+                    etype = el.evaluate("e => e.type")
+                    
+                    if tag == "select":
+                        el.select_option(label=str(value))
+                    elif etype == "checkbox":
+                        is_checked = value is True or str(value).lower() in ("true", "yes", "checked")
+                        if is_checked:
+                            el.check(force=True)
+                        else:
+                            el.uncheck(force=True)
+                    elif etype == "radio":
+                        el.check(force=True)
+                    else:
+                        # For Greenhouse 'remix' inputs, sometimes fill() fails if hidden.
+                        # We try fill() first, then fallback to type()
+                        try:
+                            el.fill(str(value), timeout=2000)
+                        except:
+                            el.focus()
+                            page.keyboard.type(str(value), delay=20)
+                    
+                    page.wait_for_timeout(200) # Small breather between fields
+                except Exception as fe:
+                    add_event(f"[W{worker_id}] Warning: Could not fill {fid}: {str(fe)[:40]}")
+            
+            # 5. Submit
+            duration_ms = int((time.time() - start) * 1000)
+            if dry_run:
+                add_event(f"[W{worker_id}] DRY RUN: Form filled, skipping submit.")
+                update_state(worker_id, status="applied", last_action="DRY RUN OK")
+                return "applied", duration_ms
+            
+            update_state(worker_id, last_action="submitting", actions=3)
+            # Find Greenhouse submit button (usually id="submit_app" or similar)
+            submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']")
+            if submit_btn:
+                submit_btn.click()
+                page.wait_for_timeout(5000) # Wait for navigation or message
+                
+                # Check for success
+                success_indicators = ["thank you", "received", "submitted", "application confirmation"]
+                content = page.content().lower()
+                if any(ind in content for ind in success_indicators):
+                    add_event(f"[W{worker_id}] APPLIED: Success indicator found.")
+                    update_state(worker_id, status="applied", last_action="Applied!")
+                    return "applied", duration_ms
+                else:
+                    add_event(f"[W{worker_id}] Warning: No clear success message found.")
+                    return "applied", duration_ms # Assume success if no error shown
+            else:
+                add_event(f"[W{worker_id}] FAILED: Could not find submit button.")
+                return "failed:no_submit_button", duration_ms
+
+        except Exception as e:
+            logger.exception("Gemini apply error")
+            duration_ms = int((time.time() - start) * 1000)
+            return f"failed:{str(e)[:100]}", duration_ms
+        finally:
+            # We don't close the browser here, cleanup_worker does it
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Per-job execution
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
-
-    Returns:
-        Tuple of (status_string, duration_ms). Status is one of:
-        'applied', 'expired', 'captcha', 'login_issue',
-        'failed:reason', or 'skipped'.
-    """
-    # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    # Build the prompt
-    agent_prompt = prompt_mod.build_prompt(
-        job=job,
-        tailored_resume=resume_text,
-        dry_run=dry_run,
-    )
-
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
-
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    worker_dir = reset_worker_dir(worker_id)
-
-    update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting")
-    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
-
-    worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
-    ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_header = (
-        f"\n{'=' * 60}\n"
-        f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
-        f"URL: {job.get('application_url') or job['url']}\n"
-        f"Score: {job.get('fit_score', 'N/A')}/10\n"
-        f"{'=' * 60}\n"
-    )
-
-    start = time.time()
-    stats: dict = {}
-    proc = None
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            cwd=str(worker_dir),
-        )
-        with _claude_lock:
-            _claude_procs[worker_id] = proc
-
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
-
-        text_parts: list[str] = []
-        with open(worker_log, "a", encoding="utf-8") as lf:
-            lf.write(log_header)
-
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
-
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
-                        stats = {
-                            "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
-                            "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
-                        }
-                        text_parts.append(msg.get("result", ""))
-                except json.JSONDecodeError:
-                    text_parts.append(line)
-                    lf.write(line + "\n")
-
-        proc.wait(timeout=300)
-        returncode = proc.returncode
-        proc = None
-
-        if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
-
-        output = "\n".join(text_parts)
-        elapsed = int(time.time() - start)
-        duration_ms = int((time.time() - start) * 1000)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(output, encoding="utf-8")
-
-        if stats:
-            cost = stats.get("cost_usd", 0)
-            ws = get_state(worker_id)
-            prev_cost = ws.total_cost if ws else 0.0
-            update_state(worker_id, total_cost=prev_cost + cost)
-
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
-
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
-
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
-
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
-
-    except subprocess.TimeoutExpired:
-        duration_ms = int((time.time() - start) * 1000)
-        elapsed = int(time.time() - start)
-        add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
-    except Exception as e:
-        duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
-    finally:
-        with _claude_lock:
-            _claude_procs.pop(worker_id, None)
-        if proc is not None and proc.poll() is None:
-            _kill_process_tree(proc.pid)
+            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int]:
+    """Execute a job application session."""
+    return run_job_gemini(job, port, worker_id, model=model, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
