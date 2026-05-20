@@ -77,13 +77,14 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0, custom_sql: str | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        custom_sql: Optional custom SQL query to restrict job selection.
 
     Returns:
         Job dict or None if the queue is empty.
@@ -103,17 +104,30 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
-            # Simple acquisition for Greenhouse jobs
-            row = conn.execute("""
-                SELECT url, title, site, application_url,
-                       fit_score, location, full_description
-                FROM jobs
-                WHERE (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
-                ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"], min_score]).fetchone()
+            if custom_sql:
+                query = f"""
+                    WITH custom_subset AS ({custom_sql})
+                    SELECT url, title, site, application_url,
+                           fit_score, location, full_description
+                    FROM custom_subset
+                    WHERE (apply_status IS NULL OR apply_status = 'failed')
+                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                      AND fit_score >= ?
+                    ORDER BY fit_score DESC, url
+                    LIMIT 1
+                """
+            else:
+                query = """
+                    SELECT url, title, site, application_url,
+                           fit_score, location, full_description
+                    FROM jobs
+                    WHERE (apply_status IS NULL OR apply_status = 'failed')
+                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                      AND fit_score >= ?
+                    ORDER BY fit_score DESC, url
+                    LIMIT 1
+                """
+            row = conn.execute(query, [config.DEFAULTS["max_apply_attempts"], min_score]).fetchone()
 
         if not row:
             conn.rollback()
@@ -472,37 +486,40 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                custom_sql: str | None = None,
+                continuous: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
         worker_id: Numeric worker identifier.
-        limit: Max jobs to process (0 = continuous).
+        limit: Max jobs to process (0 = all currently eligible).
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
+        custom_sql: Custom SQL query for job selection.
+        continuous: Run forever, polling for new jobs.
 
     Returns:
         Tuple of (applied_count, failed_count).
     """
     applied = 0
     failed = 0
-    continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
 
     while not _stop_event.is_set():
-        if not continuous and jobs_done >= limit:
+        if not continuous and limit > 0 and jobs_done >= limit:
             break
 
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, custom_sql=custom_sql)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -577,7 +594,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1, custom: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -590,6 +607,7 @@ def main(limit: int = 1, target_url: str | None = None,
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
+        custom: Use custom SQL query from test/custom_records.sql.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -597,6 +615,23 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+
+    # Load and validate custom SQL
+    custom_sql = None
+    if custom:
+        from applypilot.database import validate_and_load_custom_sql
+        custom_sql = validate_and_load_custom_sql()
+
+        # Additional check for apply stage: application_url presence
+        conn = get_connection()
+        sample_rows = conn.execute(custom_sql).fetchall()
+        for row in sample_rows:
+            if not row["application_url"]:
+                console.print(f"[red]Error: Custom SQL returned rows with empty application_url.[/red]")
+                console.print(f"Row URL: {row['url']}")
+                sys.exit(1)
+
+        console.print(f"[green]Custom SQL validated ({len(sample_rows)} jobs in pool).[/green]")
 
     if continuous:
         effective_limit = 0
@@ -621,18 +656,10 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
+            # No-op here as Claude Code is removed
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
-                    if cproc.poll() is None:
-                        _kill_process_tree(cproc.pid)
             kill_all_chrome()
             raise KeyboardInterrupt
 
@@ -661,6 +688,8 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    custom_sql=custom_sql,
+                    continuous=continuous,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -684,6 +713,8 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            custom_sql=custom_sql,
+                            continuous=continuous,
                         ): i
                         for i in range(workers)
                     }

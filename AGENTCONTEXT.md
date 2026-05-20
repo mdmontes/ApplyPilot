@@ -1,56 +1,99 @@
 # ApplyPilot Codebase Summary
 
-## Directory Architecture
+## Project Structure
+```
+ApplyPilot/
+├── analysis/              # Data analysis scripts and notebooks.
+├── prompts/               # System and specialized prompts for AI agents.
+├── src/
+│   └── applypilot/        # Core application source code.
+├── test_db/               # SQLite database snapshots for testing.
+├── test_scripts/          # Utility scripts for database population and cleanup.
+├── AGENTCONTEXT.md        # This file (AI agent context).
+├── profile.example.json   # Template for user profile configuration.
+└── pyproject.toml         # Build system dependencies and metadata.
+```
+
+## Directory Architecture (`src/applypilot/`)
 ```
 src/applypilot/
 ├── apply/
 │   ├── chrome.py          # Manages Chrome browser instances and profiles for automation.
-│   ├── dashboard.py       # Provides real-time tracking and a live dashboard for the auto-apply stage.
-│   ├── launcher.py        # Main entry point for the apply pipeline, orchestrating Claude Code sessions.
-│   └── prompt.py          # Generates and manages the complex prompts used to guide Claude Code through forms.
+│   ├── dashboard.py       # Rich terminal dashboard for tracking real-time apply progress.
+│   ├── launcher.py        # Orchestrator for the apply pipeline, supports Gemini and Claude Code engines.
+│   └── prompt.py          # Builds instructions for autonomous agents to fill forms using profile data.
 ├── config/
 │   ├── employers.yaml     # Registry of preconfigured Workday employer portals.
 │   ├── searches.example.yaml # Template for user search configurations.
 │   └── sites.yaml         # Configuration for direct career sites and extraction rules.
 ├── discovery/
-│   ├── jobspy.py          # Scrapes job boards (Indeed, LinkedIn, etc.) using the python-jobspy library.
-│   ├── smartextract.py    # AI-powered extraction of job details from non-standard career sites.
-│   └── workday.py         # Specialized scraper for Workday-based application portals.
+│   ├── jobspy.py          # Scrapes job boards (Indeed, LinkedIn, etc.) using python-jobspy.
+│   ├── smartextract.py    # AI-powered extraction of job details from arbitrary career sites.
+│   └── workday.py         # Specialized scraper for Workday-based corporate career portals.
 ├── enrichment/
-│   └── detail.py          # Fetches and extracts full job descriptions via a 3-tier cascade (JSON-LD, CSS, AI).
+│   └── detail.py          # Greenhouse API-focused enrichment of job descriptions and apply URLs.
 ├── scoring/
-│   ├── scorer.py          # AI logic for rating job fit on a scale of 1-10.
+│   ├── scorer.py          # LLM-powered job fit scoring (1-10) based on resume/profile.
 ├── wizard/
-│   └── init.py            # Implementation of the `applypilot init` setup wizard.
-├── cli.py                 # The Typer-based CLI entry point defining all user commands.
-├── config.py              # Centralized configuration management and profile loading logic.
-├── database.py            # SQLite database layer, schema definitions, and connection management.
-├── llm.py                 # Unified interface for various LLM providers (Gemini, OpenAI, Local).
-├── pipeline.py            # Orchestrator that manages the sequential or concurrent execution of pipeline stages.
-└── view.py                # Generates the self-contained HTML results dashboard for pipeline status.
+│   └── init.py            # Interactive setup wizard for profile, resume, and API configuration.
+├── cli.py                 # Typer-based CLI entry point defining all user-facing commands.
+├── config.py              # Centralized configuration, environment loading, and path management.
+├── database.py            # SQLite database layer, schema definitions, and migration logic.
+├── llm.py                 # Unified interface for LLM providers (Gemini, OpenAI, Local).
+├── pipeline.py            # Main orchestrator managing sequential or streaming execution of stages.
+└── view.py                # Generates the self-contained HTML results dashboard.
 ```
 
 ## Code Execution by Stage
 
 ### 1. Discover
-- **Purpose**: Identify job opportunities from various sources.
+- **Purpose**: Identify initial job opportunities and basic metadata.
 - **Executed Files**: `discovery/jobspy.py`, `discovery/workday.py`, `discovery/smartextract.py`.
-- **Workflow**: `pipeline.py` calls these modules to search job boards, scrape Workday portals, and hit direct career sites. Results are deduplicated and stored in the database via `database.py`.
+- **Workflow**: Searches job boards and career sites. Deduplicates results by URL and stores them in the `jobs` table.
 
 ### 2. Enrich
-- **Purpose**: Retrieve the full job description and application URL for every discovered job.
+- **Purpose**: Retrieve the full job description and absolute application URL.
 - **Executed Files**: `enrichment/detail.py`.
-- **Workflow**: Visits each job URL and uses a 3-tier approach: structured data (JSON-LD), CSS selectors, or LLM-assisted extraction to get the full text needed for scoring.
+- **Workflow**: Primarily uses the Greenhouse Job Board API (where applicable) to fetch clean markdown descriptions and direct apply links, avoiding the need for heavy scraping at this stage.
 
 ### 3. Score
-- **Purpose**: Rate every job (1-10) to determine which ones match the user's profile.
+- **Purpose**: Evaluate how well the candidate fits the job requirements.
 - **Executed Files**: `scoring/scorer.py`, `llm.py`.
-- **Workflow**: Compares the enriched job description against the user's profile using an LLM. Only jobs meeting a certain threshold proceed.
+- **Workflow**: Compares the candidate's plain-text resume against the enriched `full_description`. Assigns a 1-10 `fit_score` and populates `score_reasoning`.
 
 ### 4. Apply
-- **Purpose**: Submit the application autonomously.
-- **Executed Files**: `apply/launcher.py`, `apply/chrome.py`, `apply/prompt.py`, `apply/dashboard.py`.
-- **Workflow**: `launcher.py` coordinates browser instances via `chrome.py`. It uses `prompt.py` to instruct Claude Code to navigate forms, fill details, and upload the base resume. Progress is monitored via `dashboard.py`.
+- **Purpose**: Autonomously submit the job application.
+- **Executed Files**: `apply/launcher.py`, `apply/chrome.py`, `apply/prompt.py`.
+- **Workflow**: Acquires high-scoring jobs. Launches an isolated Chrome instance. Uses the Gemini Engine (or Claude Code) to analyze the form, map profile data to fields, and execute the submission.
+
+## SQLite Database & Stage Gating
+
+The `jobs` table in SQLite acts as the central state machine for the pipeline. Each stage is "gated" by specific columns that determine eligibility for processing.
+
+| Stage | Gating Column(s) (Trigger) | Critical Reference Columns (Input) | Populated Columns (Output) |
+| :--- | :--- | :--- | :--- |
+| **Discover** | N/A (Initial Entry) | Search Config, Site Registries | `url`, `title`, `site`, `location`, `description` |
+| **Enrich** | `detail_scraped_at IS NULL` | `url` | `full_description`, `application_url`, `detail_scraped_at` |
+| **Score** | `full_description IS NOT NULL` AND `fit_score IS NULL` | `full_description`, Resume/Profile | `fit_score`, `score_reasoning`, `scored_at` |
+| **Apply** | `fit_score >= {min}` AND `applied_at IS NULL` | `application_url`, `title`, Profile Data | `applied_at`, `apply_status`, `apply_error`, `apply_attempts` |
+
+### Key Gates & Logic
+The pipeline uses specific columns to "gate" jobs between stages. These gates can be bypassed or restricted using flags. 
+**Note on CLI Usage**: Flags like `--custom` and `--force` can be used in any order (e.g., `run --custom --force` is identical to `run --force --custom`).
+
+- **Enrichment Gate**: Eligible if `detail_scraped_at IS NULL`.
+    - **Restrict to Subset**: Use `--custom` (or `-c`) to only process jobs from `@test/custom_records.sql`.
+    - **Bypass Gate (Re-enrich)**: Use `--force` (or `-f`) to ignore the timestamp and re-process.
+    - **Example**: `applypilot run enrich --custom --force`
+- **Scoring Gate**: Eligible if `full_description IS NOT NULL` AND `fit_score IS NULL`.
+    - **Restrict to Subset**: Use `--custom` (or `-c`) to only score jobs from `@test/custom_records.sql`.
+    - **Bypass Gate (Re-score)**: Use `--force` (or `-f`) to ignore existing scores and re-evaluate.
+    - **Example**: `applypilot run score --custom --force`
+- **Apply Gate (Min Score)**: Eligible if `fit_score >= {min_score}` AND `applied_at IS NULL`.
+    - **Restrict to Subset**: Use `--custom` (or `-c`) to only apply to jobs from `@test/custom_records.sql`.
+    - **Override Score Threshold**: Use `--min-score {number}` to lower/raise the bar (default: 7).
+    - **Example**: `applypilot run apply --custom --min-score 5`
+- **Data Presence**: The `application_url` must be present (populated during Enrichment) before a job can be applied to.
 
 ## Limitations & Considerations
 As an AI agent operating within this workspace, my capabilities and limitations are defined as follows:

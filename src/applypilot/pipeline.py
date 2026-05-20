@@ -98,35 +98,35 @@ def _run_discover(workers: int = 1, dry_run: bool = False) -> dict:
     return stats
 
 
-def _run_enrich(workers: int = 1, dry_run: bool = False) -> dict:
+def _run_enrich(workers: int = 1, dry_run: bool = False, custom_sql: str | None = None, force: bool = False) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     if dry_run:
         console.print("  [yellow]Dry-run: skipping enrichment[/yellow]")
         return {"status": "ok"}
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
+        run_enrichment(workers=workers, custom_sql=custom_sql, force=force)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_score(dry_run: bool = False) -> dict:
+def _run_score(dry_run: bool = False, custom_sql: str | None = None, force: bool = False) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     if dry_run:
         console.print("  [yellow]Dry-run: skipping scoring[/yellow]")
         return {"status": "ok"}
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        run_scoring(custom_sql=custom_sql, force=force)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False) -> dict:
+def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False, custom: bool = False) -> dict:
     """Stage: Auto-apply — autonomous browser submission."""
     try:
         from applypilot.apply.launcher import main as apply_main
@@ -135,6 +135,7 @@ def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False) -> d
             min_score=min_score,
             workers=workers,
             dry_run=dry_run,
+            custom=custom,
         )
         return {"status": "ok"}
     except Exception as e:
@@ -226,6 +227,9 @@ def _run_stage_streaming(
     min_score: int = 7,
     workers: int = 1,
     dry_run: bool = False,
+    custom: bool = False,
+    custom_sql: str | None = None,
+    force: bool = False,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -239,6 +243,11 @@ def _run_stage_streaming(
         kwargs["workers"] = workers
     if stage == "apply":
         kwargs["min_score"] = min_score
+        kwargs["custom"] = custom
+        kwargs["custom_sql"] = custom_sql
+    if stage in ("enrich", "score"):
+        kwargs["custom_sql"] = custom_sql
+        kwargs["force"] = force
 
     upstream = _UPSTREAM[stage]
 
@@ -286,7 +295,7 @@ def _run_stage_streaming(
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int, workers: int = 1, dry_run: bool = False) -> dict:
+def _run_sequential(ordered: list[str], min_score: int, workers: int = 1, dry_run: bool = False, custom: bool = False, custom_sql: str | None = None, force: bool = False) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -308,6 +317,11 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1, dry_ru
                 kwargs["workers"] = workers
             if name == "apply":
                 kwargs["min_score"] = min_score
+                kwargs["custom"] = custom
+                kwargs["custom_sql"] = custom_sql
+            if name in ("enrich", "score"):
+                kwargs["custom_sql"] = custom_sql
+                kwargs["force"] = force
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -338,7 +352,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1, dry_ru
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int, workers: int = 1, dry_run: bool = False) -> dict:
+def _run_streaming(ordered: list[str], min_score: int, workers: int = 1, dry_run: bool = False, custom: bool = False, custom_sql: str | None = None, force: bool = False) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -367,6 +381,9 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1, dry_run
                 "min_score": min_score,
                 "workers": workers,
                 "dry_run": dry_run,
+                "custom": custom,
+                "custom_sql": custom_sql,
+                "force": force,
             },
             name=f"pipeline-{name}"
         )
@@ -410,6 +427,8 @@ def run_pipeline(
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
+    custom: bool = False,
+    force: bool = False,
 ) -> dict:
     """Run specified pipeline stages in order.
 
@@ -423,11 +442,17 @@ def run_pipeline(
     ensure_dirs()
     load_env()
 
+    # Load custom SQL if requested
+    custom_sql = None
+    if custom:
+        from applypilot.database import validate_and_load_custom_sql
+        custom_sql = validate_and_load_custom_sql()
+
     # Execute
     if stream:
-        result = _run_streaming(ordered, min_score, workers=workers, dry_run=dry_run)
+        result = _run_streaming(ordered, min_score, workers=workers, dry_run=dry_run, custom=custom, custom_sql=custom_sql, force=force)
     else:
-        result = _run_sequential(ordered, min_score, workers=workers, dry_run=dry_run)
+        result = _run_sequential(ordered, min_score, workers=workers, dry_run=dry_run, custom=custom, custom_sql=custom_sql, force=force)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

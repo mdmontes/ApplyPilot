@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description (in Markdown format), score how well the candidate fits the role.
 
 SCORING CRITERIA:
 - 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
@@ -34,6 +34,9 @@ IMPORTANT FACTORS:
 - Consider transferable experience (automation, scripting, API work)
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+
+INSTRUCTIONS:
+- The job description is provided in Markdown. Use the structural cues (headers, lists) to better understand the role requirements.
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
@@ -84,7 +87,7 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION (Markdown):\n{(job.get('full_description') or '')[:8000]}"
     )
 
     messages = [
@@ -101,12 +104,13 @@ def score_job(resume_text: str, job: dict) -> dict:
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
-    """Score unscored jobs that have full descriptions.
+def run_scoring(limit: int = 0, force: bool = False, custom_sql: str | None = None) -> dict:
+    """Score jobs that have full descriptions.
 
     Args:
         limit: Maximum number of jobs to score in this run.
-        rescore: If True, re-score all jobs (not just unscored ones).
+        force: If True, re-score jobs (ignore 'fit_score IS NULL' gate).
+        custom_sql: Optional custom SQL query to restrict job selection.
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -114,7 +118,14 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
-    if rescore:
+    if custom_sql:
+        query = f"WITH custom_subset AS ({custom_sql}) SELECT * FROM custom_subset WHERE full_description IS NOT NULL"
+        if not force:
+            query += " AND fit_score IS NULL"
+        if limit > 0:
+            query += f" LIMIT {limit}"
+        jobs = conn.execute(query).fetchall()
+    elif force:
         query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
         if limit > 0:
             query += f" LIMIT {limit}"
@@ -123,7 +134,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
 
     if not jobs:
-        log.info("No unscored jobs with descriptions found.")
+        log.info("No jobs with descriptions found to score.")
         return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
 
     # Convert sqlite3.Row to dicts if needed

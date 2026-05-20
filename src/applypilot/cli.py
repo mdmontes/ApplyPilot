@@ -88,6 +88,8 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    custom: bool = typer.Option(False, "--custom", "-c", help="Use custom query from test/custom_records.sql"),
+    force: bool = typer.Option(False, "--force", "-f", help="Ignore gating columns (e.g. re-enrich or re-score)."),
 ) -> None:
     """Run pipeline stages: discover, enrich, score."""
     _bootstrap()
@@ -116,6 +118,8 @@ def run(
         dry_run=dry_run,
         stream=stream,
         workers=workers,
+        custom=custom,
+        force=force,
     )
 
     if result.get("errors"):

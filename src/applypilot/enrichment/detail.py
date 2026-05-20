@@ -8,11 +8,12 @@ import logging
 import re
 import sqlite3
 import time
+import html
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
-from bs4 import BeautifulSoup
+from markdownify import markdownify as md
 
 from applypilot.database import init_db
 
@@ -21,39 +22,64 @@ log = logging.getLogger(__name__)
 # -- Greenhouse API logic ----------------------------------------------------
 
 def parse_greenhouse_url(url: str) -> dict | None:
-    """Extract board_token and job_id from a Greenhouse URL.
+    """Extract board_token and job_id from a Greenhouse URL using multiple strategies.
     
     Examples:
-      - https://job-boards.greenhouse.io/globalizationpartners/jobs/7692014003
-      - https://job-boards.eu.greenhouse.io/agency/jobs/4633535101
-      - https://boards.greenhouse.io/andurilindustries/jobs/5090905007?gh_jid=5090905007
+      - Native: https://boards.greenhouse.io/andurilindustries/jobs/5090905007?gh_jid=5090905007
+      - Custom: https://www.brex.com/careers/8366850002?gh_jid=8366850002
     """
+    from urllib.parse import parse_qs
     parsed = urlparse(url)
     hostname = parsed.netloc.lower()
     path_parts = [p for p in parsed.path.split('/') if p]
+    qs = parse_qs(parsed.query)
+
+    # 1. Standard Job ID extraction (gh_jid parameter is the most reliable)
+    job_id = qs.get("gh_jid", [None])[0]
+    if not job_id and len(path_parts) >= 3 and path_parts[1] == "jobs":
+        job_id = path_parts[2]
+    
+    if not job_id:
+        return None
+
+    # 2. Extract board token (company name)
+    board_token = None
+    
+    # Strategy A: Native Greenhouse domains
+    if "greenhouse.io" in hostname:
+        if path_parts:
+            board_token = path_parts[0]
+    
+    # Strategy B: Custom domain fallback
+    if not board_token:
+        # Strip common subdomains and get the primary domain name
+        domain_parts = hostname.split('.')
+        # Filter out junk
+        ignored = {"www", "careers", "jobs", "job-boards", "boards", "eu", "com", "io", "net", "org"}
+        candidates = [p for p in domain_parts if p not in ignored]
+        if candidates:
+            board_token = candidates[0]
+
+    if not board_token:
+        return None
 
     # Detect region
     is_eu = "eu.greenhouse.io" in hostname
     base_url = "https://boards-api.eu.greenhouse.io/v1" if is_eu else "https://boards-api.greenhouse.io/v1"
 
-    # Pattern: /board_token/jobs/job_id
-    if len(path_parts) >= 3 and path_parts[1] == "jobs":
-        board_token = path_parts[0]
-        job_id = path_parts[2]
-        return {
-            "api_url": f"{base_url}/boards/{board_token}/jobs/{job_id}",
-            "board_token": board_token,
-            "job_id": job_id
-        }
-
-    return None
+    return {
+        "api_url": f"{base_url}/boards/{board_token}/jobs/{job_id}",
+        "board_token": board_token,
+        "job_id": job_id
+    }
 
 
 def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
     """Fetch job details from Greenhouse API with rate limit handling."""
     info = parse_greenhouse_url(url)
     if not info:
-        return {"error": "not a recognized Greenhouse URL"}
+        log.info("  fallback | could not parse Greenhouse URL, using original")
+        return {"full_description": None, "application_url": url, "status": "ok"}
 
     retry_count = 0
     base_delay = 2.0
@@ -88,7 +114,8 @@ def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
                     continue
 
                 if resp.status_code == 404:
-                    return {"error": "job not found (404)"}
+                    log.info("  fallback | job not found via API, using original")
+                    return {"full_description": None, "application_url": url, "status": "ok"}
                 
                 resp.raise_for_status()
                 data = resp.json()
@@ -124,29 +151,23 @@ def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
 # -- Description cleaning ---------------------------------------------------
 
 def clean_description(text: str) -> str:
-    """Convert HTML description to clean readable text."""
+    """Convert HTML description to clean readable Markdown text."""
     if not text:
         return ""
 
-    if "<" in text and ">" in text:
-        soup = BeautifulSoup(text, "html.parser")
-        for br in soup.find_all("br"):
-            br.replace_with("\n")
-        for tag in soup.find_all(["p", "div", "h1", "h2", "h3", "h4", "li", "tr"]):
-            tag.insert_before("\n")
-            tag.insert_after("\n")
-        for li in soup.find_all("li"):
-            li.insert_before("- ")
-        text = soup.get_text()
+    # 1. Unescape HTML entities (e.g., &lt; to <) which are common in API responses
+    text = html.unescape(text)
 
-    lines = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if line:
-            lines.append(line)
+    # 2. Translate HTML tags to structural plain text markup, omitting attributes
+    clean_markdown = md(
+        text,
+        heading_style="ATX",              # Standardizes titles with # tags
+        strip=['style', 'script', 'meta'] # Explicitly drop vendor metadata tags
+    )
 
+    # 3. Remove extra trailing newlines and whitespace
+    lines = [line.rstrip() for line in clean_markdown.splitlines() if line.strip()]
     text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
@@ -225,15 +246,23 @@ def _run_detail_scraper(
     sites: list[str] | None = None,
     max_per_site: int | None = None,
     workers: int = 1,
+    custom_sql: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Groups pending jobs by site and processes each batch."""
-    where = "WHERE detail_scraped_at IS NULL"
-    rows = conn.execute(
-        f"SELECT url, title, site FROM jobs {where} ORDER BY site"
-    ).fetchall()
+    if custom_sql:
+        query = f"WITH custom_subset AS ({custom_sql}) SELECT url, title, site FROM custom_subset"
+        if not force:
+            query += " WHERE detail_scraped_at IS NULL"
+    else:
+        where = "WHERE detail_scraped_at IS NULL" if not force else "WHERE 1=1"
+        query = f"SELECT url, title, site FROM jobs {where}"
+    
+    query += " ORDER BY site"
+    rows = conn.execute(query).fetchall()
 
     if not rows:
-        log.info("No pending jobs to scrape.")
+        log.info("No jobs to enrich.")
         return {"processed": 0, "ok": 0, "error": 0}
 
     site_jobs: dict[str, list[tuple]] = {}
@@ -303,8 +332,8 @@ def stream_detail(
         my_done.set()
 
 
-def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
+def run_enrichment(limit: int = 100, workers: int = 1, custom_sql: str | None = None, force: bool = False) -> dict:
     """Main entry point for detail page enrichment."""
     conn = init_db()
-    stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers)
+    stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers, custom_sql=custom_sql, force=force)
     return stats

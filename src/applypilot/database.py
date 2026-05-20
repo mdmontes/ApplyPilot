@@ -397,3 +397,46 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+def validate_and_load_custom_sql() -> str | None:
+    """Read and validate custom SQL from src/applypilot/test/custom_records.sql.
+
+    Returns:
+        Cleaned SQL string if valid, else raises SystemExit(1).
+    """
+    from applypilot import config
+    import sys
+    from rich.console import Console
+    console = Console()
+
+    sql_file = config.PACKAGE_DIR / "test" / "custom_records.sql"
+    if not sql_file.exists():
+        console.print(f"[red]Custom SQL file not found:[/red] {sql_file}")
+        sys.exit(1)
+
+    custom_sql = sql_file.read_text(encoding="utf-8").strip().rstrip(';')
+    if not custom_sql:
+        console.print(f"[red]Custom SQL file is empty:[/red] {sql_file}")
+        sys.exit(1)
+
+    # Structural validation
+    conn = get_connection()
+    try:
+        sample_rows = conn.execute(custom_sql).fetchall()
+        if not sample_rows:
+            console.print(f"[yellow]Custom SQL returned 0 jobs. Exiting.[/yellow]")
+            sys.exit(0)
+        
+        sample = sample_rows[0]
+        cols = sample.keys()
+        required = ["url", "title", "site", "application_url", "fit_score", "location", "full_description"]
+        missing = [c for c in required if c not in cols]
+        if missing:
+            console.print(f"[red]Custom SQL missing required columns:[/red] {', '.join(missing)}")
+            sys.exit(1)
+            
+        return custom_sql
+    except Exception as e:
+        console.print(f"[red]Custom SQL validation failed:[/red] {e}")
+        sys.exit(1)
