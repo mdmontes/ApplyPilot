@@ -101,9 +101,11 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
+            greenhouse_api_url    TEXT,
             application_url       TEXT,
             detail_scraped_at     TEXT,
             detail_error          TEXT,
+            application_schema    TEXT,
 
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
@@ -156,9 +158,11 @@ _ALL_COLUMNS: dict[str, str] = {
     "discovered_at": "TEXT",
     # Enrichment
     "full_description": "TEXT",
+    "greenhouse_api_url": "TEXT",
     "application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
+    "application_schema": "TEXT",
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",

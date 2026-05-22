@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import html
+import json
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -74,27 +75,21 @@ def parse_greenhouse_url(url: str) -> dict | None:
     }
 
 
-def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
-    """Fetch job details from Greenhouse API with rate limit handling."""
-    info = parse_greenhouse_url(url)
-    if not info:
-        log.info("  fallback | could not parse Greenhouse URL, using original")
-        return {"full_description": None, "application_url": url, "status": "ok"}
-
+def _call_greenhouse_api(api_url: str, max_retries: int = 3) -> tuple[dict | None, str | None]:
+    """Internal helper to fetch data from a Greenhouse API URL with retry logic."""
     retry_count = 0
     base_delay = 2.0
 
     while retry_count <= max_retries:
         try:
             with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-                resp = client.get(info["api_url"])
+                resp = client.get(api_url)
                 
                 if resp.status_code == 429:
                     retry_count += 1
                     if retry_count > max_retries:
-                        return {"error": "rate limit exceeded after retries"}
+                        return None, "rate limit exceeded after retries"
                     
-                    # Respect headers or back off
                     wait_time = resp.headers.get("Retry-After")
                     if not wait_time:
                         reset_time = resp.headers.get("X-RateLimit-Reset")
@@ -109,43 +104,92 @@ def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
                         wait_time = (base_delay ** retry_count) + (random.random() * 0.5)
                     
                     log.warning("Rate limited (429) for %s. Waiting %.1fs (retry %d/%d)", 
-                                info["board_token"], float(wait_time), retry_count, max_retries)
+                                api_url, float(wait_time), retry_count, max_retries)
                     time.sleep(float(wait_time))
                     continue
 
                 if resp.status_code == 404:
-                    log.info("  fallback | job not found via API, using original")
-                    return {"full_description": None, "application_url": url, "status": "ok"}
+                    return None, "job not found via API"
                 
                 resp.raise_for_status()
-                data = resp.json()
-
-                desc = data.get("content")
-                if desc:
-                    desc = clean_description(desc)
-
-                apply_url = data.get("absolute_url")
-
-                if not desc or not apply_url:
-                    return {"error": "incomplete data from API"}
-
-                return {
-                    "full_description": desc,
-                    "application_url": apply_url,
-                    "status": "ok"
-                }
+                return resp.json(), None
         except httpx.HTTPStatusError as e:
-            return {"error": f"HTTP {e.response.status_code}: {str(e)}"}
+            return None, f"HTTP {e.response.status_code}: {str(e)}"
         except Exception as e:
             if retry_count < max_retries:
                 retry_count += 1
                 wait = base_delay ** retry_count
-                log.warning("Error fetching %s: %s. Retrying in %.1fs...", url, e, wait)
+                log.warning("Error fetching %s: %s. Retrying in %.1fs...", api_url, e, wait)
                 time.sleep(wait)
                 continue
-            return {"error": str(e)}
+            return None, str(e)
+    return None, "max retries exceeded"
 
-    return {"error": "max retries exceeded"}
+
+def fetch_greenhouse_job(url: str, max_retries: int = 3) -> dict:
+    """Fetch job details from Greenhouse API with rate limit handling."""
+    info = parse_greenhouse_url(url)
+    if not info:
+        log.info("  fallback | could not parse Greenhouse URL, using original")
+        return {"full_description": None, "application_url": url, "status": "ok", "greenhouse_api_url": None, "application_schema": None}
+
+    # Try with ?questions=true first
+    api_url_with_questions = f"{info['api_url']}?questions=true"
+    data_with_questions, error_with_questions = _call_greenhouse_api(api_url_with_questions, max_retries)
+
+    if data_with_questions:
+        desc = data_with_questions.get("content")
+        apply_url = data_with_questions.get("absolute_url")
+        if desc and apply_url:
+            if desc:
+                desc = clean_description(desc)
+            
+            schema_data_with_questions = data_with_questions.copy()
+            schema_data_with_questions.pop('content', None) # Remove 'content'
+            return {
+                "full_description": desc,
+                "application_url": apply_url,
+                "status": "ok",
+                "greenhouse_api_url": api_url_with_questions,
+                "application_schema": json.dumps(schema_data_with_questions)
+            }
+        else:
+            log.info("  fallback | API with ?questions=true returned incomplete data, trying without")
+
+    # Fallback to API without ?questions=true
+    api_url_without_questions = info['api_url']
+    data_without_questions, error_without_questions = _call_greenhouse_api(api_url_without_questions, max_retries)
+
+    if data_without_questions:
+        desc = data_without_questions.get("content")
+        apply_url = data_without_questions.get("absolute_url")
+        if desc and apply_url:
+            if desc:
+                desc = clean_description(desc)
+            
+            schema_data_without_questions = data_without_questions.copy()
+            schema_data_without_questions.pop('content', None) # Remove 'content'
+            return {
+                "full_description": desc,
+                "application_url": apply_url,
+                "status": "ok",
+                "greenhouse_api_url": api_url_without_questions,
+                "application_schema": json.dumps(schema_data_without_questions)
+            }
+        else:
+            log.info("  fallback | API without ?questions=true returned incomplete data")
+
+    # If both attempts failed or returned incomplete data
+    log.info("  error | app details not available after both API attempts")
+    return {
+        "full_description": None,
+        "application_url": url, # Keep original URL as application_url fallback
+        "status": "error",
+        "error": "app details not available",
+        "greenhouse_api_url": None,
+        "application_schema": None
+    }
+
 
 
 # -- Description cleaning ---------------------------------------------------
@@ -218,8 +262,11 @@ def scrape_site_batch(
             stats["ok"] += 1
             conn.execute(
                 "UPDATE jobs SET full_description = ?, application_url = ?, "
+                "greenhouse_api_url = ?, application_schema = ?, "
                 "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                (result.get("full_description"), result.get("application_url"), now, url),
+                (result.get("full_description"), result.get("application_url"), 
+                 result.get("greenhouse_api_url"), result.get("application_schema"), 
+                 now, url),
             )
             log.info("  ok | desc=%d chars | %.1fs", len(result["full_description"]), elapsed)
         else:
