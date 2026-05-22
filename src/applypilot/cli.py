@@ -67,7 +67,7 @@ def main(
 
 @app.command()
 def init() -> None:
-    """Run the first-time setup wizard (profile, resume, search config)."""
+    """Initialize ApplyPilot: create your profile, upload your resume, and configure search parameters."""
     from applypilot.wizard.init import run_wizard
 
     run_wizard()
@@ -80,18 +80,23 @@ def run(
         help=(
             "Pipeline stages to run. "
             f"Valid: {', '.join(VALID_STAGES)}, all. "
-            "Note: 'discover' is currently experimental for Greenhouse. "
-            "Defaults to 'all' if omitted."
+            "Defaults to 'all' (discover -> enrich -> score) if omitted."
         ),
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for auto-apply eligibility."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
-    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
-    custom: bool = typer.Option(False, "--custom", "-c", help="Use custom query from test/custom_records.sql"),
-    force: bool = typer.Option(False, "--force", "-f", help="Ignore gating columns (e.g. re-enrich or re-score)."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score threshold for scoring and auto-apply stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel workers for discovery, enrichment, and apply stages."),
+    stream: bool = typer.Option(False, "--stream", help="Enable streaming mode: run all stages concurrently using the database as a conveyor belt."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage actions without executing them (e.g., populate forms without submitting)."),
+    custom: bool = typer.Option(False, "--custom", "-c", help="Restrict processing to the job subset defined in src/applypilot/test/custom_records.sql."),
+    force: bool = typer.Option(False, "--force", "-f", help="Bypass stage gates and re-process jobs (e.g., re-enrich or re-score existing records)."),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score."""
+    """Execute the core pipeline stages: discover, enrich, score, and apply.
+
+    Examples:
+      applypilot run                        # Run all stages (except apply) sequentially
+      applypilot run enrich score --custom  # Re-enrich and score the custom job subset
+      applypilot run apply --min-score 8    # Auto-apply to all jobs with score 8+
+    """
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -128,21 +133,31 @@ def run(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("gemini-2.0-flash", "--model", "-m", help="Gemini model name."),
-    continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
-    headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
-    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
-    gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
-    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
-    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
-    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
-    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Maximum number of applications to submit in this session."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers to spawn."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score (1-10) required for a job to be eligible for auto-apply."),
+    model: str = typer.Option("gemini-2.0-flash", "--model", "-m", help="Gemini model to use for surgical form-filling fallbacks."),
+    continuous: bool = typer.Option(False, "--continuous", "-C", help="Run in continuous mode, polling the database for new high-scoring jobs indefinitely."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simulate applications: populate form fields and log details without clicking 'Submit'."),
+    headless: bool = typer.Option(True, "--headless/--no-headless", help="Run browsers in headless mode (default). Set to --no-headless to see the automation."),
+    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL, ignoring the database queue."),
+    gen: bool = typer.Option(False, "--gen", help="Generate a prompt file and MCP config for manual debugging with the Claude/Gemini CLI."),
+    custom: bool = typer.Option(False, "--custom", "-c", help="Only apply to the subset of jobs defined in src/applypilot/test/custom_records.sql."),
+    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark the specified job URL as 'applied' in the database."),
+    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark the specified job URL as 'failed' (requires --fail-reason)."),
+    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for manually marking a job as failed."),
+    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all jobs marked as 'failed' back to NULL status for retry."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Launch the Auto-Apply engine to autonomously submit job applications.
+
+    Uses a Zero-DOM strategy: instant JS injection for standard fields, 
+    with surgical Gemini fallback for required custom questions.
+
+    Examples:
+      applypilot apply --dry-run -c         # Dry-run on custom job subset
+      applypilot apply --min-score 9 --limit 5 # Submit top 5 perfect matches
+      applypilot apply --no-headless --url <URL> # Debug specific application visibly
+    """
     _bootstrap()
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
@@ -238,12 +253,13 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        custom=custom,
     )
 
 
 @app.command()
 def status() -> None:
-    """Show pipeline statistics from the database."""
+    """Display real-time statistics and progress for all jobs in the database."""
     _bootstrap()
 
     from applypilot.database import get_stats
@@ -309,7 +325,7 @@ def status() -> None:
 
 @app.command()
 def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+    """Generate a self-contained HTML dashboard of your jobs and open it in your browser."""
     _bootstrap()
 
     from applypilot.view import open_dashboard
@@ -319,7 +335,7 @@ def dashboard() -> None:
 
 @app.command()
 def doctor() -> None:
-    """Check your setup and diagnose missing requirements."""
+    """Diagnose your environment: check API keys, dependencies, and system configuration."""
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,

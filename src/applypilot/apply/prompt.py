@@ -186,7 +186,7 @@ def build_gemini_fill_prompt(job: dict, form_structure: str) -> str:
     profile_summary = _build_profile_summary(profile)
 
     prompt = f"""You are a helpful assistant mapping a job application form to a candidate's profile.
-Your goal is to provide a JSON object mapping HTML element IDs to the appropriate values from the candidate's profile.
+Your goal is to provide a JSON object mapping HTML element IDs to both the appropriate value and the human-readable question/label.
 
 == CANDIDATE PROFILE ==
 {profile_summary}
@@ -199,20 +199,33 @@ Company: {job.get('site', 'Unknown')}
 {form_structure}
 
 == INSTRUCTIONS ==
-1. Carefully analyze the form structure.
+1. Carefully analyze the form structure provided.
 2. For each relevant field (input, select, textarea), determine the best value from the candidate's profile.
-3. Return ONLY a JSON object where keys are the HTML IDs and values are the text to be entered or the option to be selected.
-4. For the resume upload field (usually id="resume" or similar), use the string "PDF_RESUME_UPLOAD".
-5. If a field is required (*) and you don't have a specific value, provide a reasonable default (e.g., "N/A" or "0").
-6. For checkboxes, use true/false.
-7. Use the EXACT HTML IDs provided in the form structure.
+3. For standard questions (First Name, Email, Phone, LinkedIn, GitHub, Website), map them accurately.
+4. For Work Authorization, EEOC (Gender, Race, Veteran, Disability), and Clearance questions, use the profile to provide honest and consistent answers.
+5. For the resume upload field (usually id="resume" or type="file"), use the string "PDF_RESUME_UPLOAD" as the value.
+6. If a field is required (*) and you don't have a specific value, provide a reasonable default (e.g., "N/A" or "0").
+7. Return a JSON object where keys are the EXACT HTML IDs provided, and values are nested objects containing "value" and "label".
+8. The "label" MUST be the human-readable question or field name found in the form structure.
 
 Example output:
 {{
-  "first_name": "John",
-  "last_name": "Doe",
-  "email": "john.doe@example.com",
-  "resume": "PDF_RESUME_UPLOAD"
+  "first_name": {{
+    "value": "John",
+    "label": "First Name"
+  }},
+  "email": {{
+    "value": "john.doe@example.com",
+    "label": "Email Address"
+  }},
+  "resume_input": {{
+    "value": "PDF_RESUME_UPLOAD",
+    "label": "Resume/CV"
+  }},
+  "question_123": {{
+    "value": "Yes",
+    "label": "Are you legally authorized to work in the US?"
+  }}
 }}
 """
     return prompt

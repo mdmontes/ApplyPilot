@@ -92,8 +92,17 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self.total_cost: float = 0.0
 
     # -- Native Gemini API --------------------------------------------------
+
+    def _update_cost(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """Update cumulative session cost based on Gemini 2.0 Flash pricing.
+        
+        Pricing: $0.10 / 1M input tokens, $0.40 / 1M output tokens.
+        """
+        cost = (prompt_tokens * 0.0000001) + (completion_tokens * 0.0000004)
+        self.total_cost += cost
 
     def _chat_native_gemini(
         self,
@@ -142,6 +151,14 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
+        
+        # Track usage
+        usage = data.get("usageMetadata", {})
+        self._update_cost(
+            usage.get("promptTokenCount", 0),
+            usage.get("candidatesTokenCount", 0)
+        )
+        
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
     # -- OpenAI-compat API --------------------------------------------------
@@ -175,12 +192,16 @@ class LLMClient:
         if resp.status_code in (403, 404) and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
-        return self._handle_compat_response(resp)
-
-    @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
+        
+        # Track usage
+        usage = data.get("usage", {})
+        self._update_cost(
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0)
+        )
+        
         return data["choices"][0]["message"]["content"]
 
     # -- public API ---------------------------------------------------------

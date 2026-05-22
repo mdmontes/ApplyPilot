@@ -1,7 +1,7 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn Gemini Code sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + Gemini Code for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
@@ -113,6 +113,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                     WHERE (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
                       AND fit_score >= ?
+                      AND application_url IS NOT NULL
                     ORDER BY fit_score DESC, url
                     LIMIT 1
                 """
@@ -162,7 +163,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None,
+                application_details: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
@@ -170,17 +172,19 @@ def mark_result(url: str, status: str, error: str | None = None,
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           application_details = ?
             WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+        """, (now, duration_ms, task_id, application_details, url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           application_details = ?
             WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
+        """, (status, error or "unknown", duration_ms, task_id, application_details, url))
     conn.commit()
 
 
@@ -200,7 +204,7 @@ def release_lock(url: str) -> None:
 
 def gen_prompt(target_url: str, min_score: int = 7,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+    """Generate a prompt file and print the Gemini CLI command for manual debugging.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -276,61 +280,18 @@ def reset_failed() -> int:
 # Per-job execution (Gemini Engine)
 # ---------------------------------------------------------------------------
 
-def extract_form_structure(page) -> str:
-    """Extract visible form fields and their associated labels/IDs."""
-    fields = page.evaluate("""() => {
-        const results = [];
-        const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
-        
-        inputs.forEach(input => {
-            // Skip hidden or non-functional inputs
-            const style = window.getComputedStyle(input);
-            if (input.type === 'hidden' || style.display === 'none' || style.visibility === 'hidden') return;
-            if (input.type === 'submit' || input.type === 'button') return;
-
-            let labelText = '';
-            // 1. Label by 'for'
-            if (input.id) {
-                const label = document.querySelector(`label[for="${input.id}"]`);
-                if (label) labelText = label.innerText;
-            }
-            // 2. Parent label
-            if (!labelText) {
-                const parentLabel = input.closest('label');
-                if (parentLabel) labelText = parentLabel.innerText;
-            }
-            // 3. Aria-label or Placeholder
-            if (!labelText) labelText = input.getAttribute('aria-label') || input.placeholder || '';
-
-            results.push({
-                id: input.id || '',
-                name: input.name || '',
-                type: input.tagName.toLowerCase() === 'input' ? input.type : input.tagName.toLowerCase(),
-                label: labelText.replace(/\\n/g, ' ').trim(),
-                required: input.required || input.getAttribute('aria-required') === 'true'
-            });
-        });
-        return results;
-    }""")
-    
-    lines = []
-    for f in fields:
-        req = " (REQUIRED)" if f['required'] else ""
-        lines.append(f"- {f['label']}{req} | ID: {f['id']} | Type: {f['type']}")
-    
-    return "\n".join(lines)
-
-
 def run_job_gemini(job: dict, port: int, worker_id: int = 0,
-                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int]:
-    """Execute a one-shot job application using Gemini + Playwright."""
+                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None]:
+    """Execute a one-shot job application using Partial-DOM + Gemini fallback."""
     start = time.time()
+    application_details = {}
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
                  start_time=start, actions=0, last_action="navigating")
-    add_event(f"[W{worker_id}] Starting (Gemini): {job['title'][:40]} @ {job.get('site', '')}")
+    add_event(f"[W{worker_id}] Starting (Partial-DOM): {job['title'][:40]} @ {job.get('site', '')}")
 
     url = job.get("application_url") or job["url"]
+    profile = config.load_profile()
     
     with sync_playwright() as p:
         try:
@@ -340,106 +301,243 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
             
             # 1. Navigate
             page.goto(url, wait_until="networkidle", timeout=60000)
-            update_state(worker_id, last_action="extracting form", actions=1)
+            update_state(worker_id, last_action="Identifying form context", actions=1)
             
-            # 2. Extract Structure
-            form_text = extract_form_structure(page)
-            
-            # 3. Ask Gemini
-            prompt = prompt_mod.build_gemini_fill_prompt(job, form_text)
-            llm = get_client()
-            response = llm.ask(prompt)
-            
-            # Clean up JSON response (it might have markdown blocks)
-            json_str = response.strip()
-            if "```json" in json_str:
-                json_str = json_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in json_str:
-                json_str = json_str.split("```")[1].split("```")[0].strip()
-            
-            field_map = json.loads(json_str)
-            
-            # 4. Fill Form
-            update_state(worker_id, last_action="filling form", actions=2)
-            for fid, value in field_map.items():
-                if not fid: continue
+            # 2. Robust Programmatic Injection
+            static_field_map = {
+                "first_name": profile["personal"].get("full_name", "").split()[0],
+                "last_name": profile["personal"].get("full_name", "").split()[-1] if " " in profile["personal"].get("full_name", "") else "",
+                "email": profile["personal"].get("email", ""),
+                "phone": profile["personal"].get("phone", ""),
+                "org": profile["experience"].get("current_company", profile["experience"].get("current_title", "")),
+                "linkedin": profile["personal"].get("linkedin_url", ""),
+                "github": profile["personal"].get("github_url", ""),
+                "website": profile["personal"].get("website_url", ""),
+                "portfolio": profile["personal"].get("portfolio_url", "")
+            }
+
+            injection_script = """
+            (profileStr) => {
+                const data = JSON.parse(profileStr);
+                const mappings = [
+                    { key: 'first_name', label: 'First Name', selectors: ['#first_name', 'input[name="first_name"]', 'input[autocomplete="given-name"]'] },
+                    { key: 'last_name', label: 'Last Name', selectors: ['#last_name', 'input[name="last_name"]', 'input[autocomplete="family-name"]'] },
+                    { key: 'email', label: 'Email', selectors: ['#email', 'input[name="email"]', 'input[type="email"]', 'input[autocomplete="email"]'] },
+                    { key: 'phone', label: 'Phone', selectors: ['#phone', 'input[name="phone"]', 'input[type="tel"]', 'input[autocomplete="tel"]'] },
+                    { key: 'org', label: 'Company', selectors: ['#org', 'input[name="org"]', 'input[name="company"]'] },
+                    { key: 'linkedin', label: 'LinkedIn', selectors: ['#urls\\\\[LinkedIn\\\\]', 'input[name*="linkedin"]'] },
+                    { key: 'github', label: 'GitHub', selectors: ['#urls\\\\[GitHub\\\\]', 'input[name*="github"]'] },
+                    { key: 'website', label: 'Website', selectors: ['#urls\\\\[Website\\\\]', 'input[name*="website"]'] },
+                    { key: 'portfolio', label: 'Portfolio', selectors: ['#urls\\\\[Portfolio\\\\]', 'input[name*="portfolio"]'] }
+                ];
                 
-                if value == "PDF_RESUME_UPLOAD":
-                    # Handle resume upload
-                    if config.RESUME_PDF_PATH.exists():
-                        try:
-                            page.set_input_files(f"#{fid}", str(config.RESUME_PDF_PATH))
-                        except Exception as e:
-                            add_event(f"[W{worker_id}] Upload error on {fid}: {str(e)[:40]}")
-                    continue
+                let results = {};
+                for (const m of mappings) {
+                    const value = data[m.key];
+                    if (!value) continue;
+                    
+                    let el = null;
+                    for (const s of m.selectors) {
+                        el = document.querySelector(s);
+                        if (el) break;
+                    }
+                    
+                    // Fallback: search by label text
+                    if (!el) {
+                        const labels = Array.from(document.querySelectorAll('label'));
+                        const targetLabel = labels.find(l => l.innerText.toLowerCase().includes(m.label.toLowerCase()));
+                        if (targetLabel && targetLabel.htmlFor) {
+                            el = document.getElementById(targetLabel.htmlFor);
+                        }
+                        if (!el && targetLabel) {
+                            el = targetLabel.querySelector('input, select, textarea');
+                        }
+                    }
+
+                    if (el) {
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        results[m.label] = value;
+                    }
+                }
+                return results;
+            }
+            """
+            
+            programmatic_filled = page.evaluate(injection_script, json.dumps(static_field_map))
+            application_details.update(programmatic_filled)
+            
+            # 3. Initial Programmatic Resume Upload
+            resume_path = config.RESUME_PDF_PATH
+            resume_uploaded = False
+            if resume_path.exists():
+                # Try common Greenhouse ID and generic selectors
+                resume_selectors = ["input[type='file'][id='job_application_resume']", "input[type='file'][name*='resume']"]
+                for sel in resume_selectors:
+                    input_el = page.locator(sel)
+                    if input_el.count() > 0:
+                        input_el.set_input_files(str(resume_path))
+                        application_details["Resume/CV"] = str(resume_path)
+                        resume_uploaded = True
+                        break
+            
+            # 4. LLM Fallback with Cost Cap
+            update_state(worker_id, last_action="evaluating missing fields", actions=2)
+            
+            # Capture all unfilled fields (not just required, to maximize quality)
+            unfilled_fields = page.evaluate("""() => {
+                const results = [];
+                const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
+                inputs.forEach(input => {
+                    const style = window.getComputedStyle(input);
+                    if (input.type === 'hidden' || style.display === 'none' || style.visibility === 'hidden') return;
+                    if (input.type === 'submit' || input.type === 'button') return;
+                    
+                    // Only process if currently empty
+                    if (!input.value || (input.type === 'file' && input.files.length === 0)) {
+                        let labelText = '';
+                        if (input.id) {
+                            const label = document.querySelector(`label[for="${input.id}"]`);
+                            if (label) labelText = label.innerText;
+                        }
+                        if (!labelText) {
+                            const parentLabel = input.closest('label');
+                            if (parentLabel) labelText = parentLabel.innerText;
+                        }
+                        if (!labelText) labelText = input.getAttribute('aria-label') || input.placeholder || '';
+
+                        const isRequired = input.required || input.getAttribute('aria-required') === 'true' || 
+                                         input.closest('.required') || input.parentElement.innerText.includes('*');
+                        
+                        const isResumeField = input.type === 'file' || 
+                                           labelText.toLowerCase().includes('resume') || 
+                                           labelText.toLowerCase().includes('cv');
+
+                        // ALWAYS include resume/file fields, even if not required
+                        if (isRequired || isResumeField) {
+                            results.push({
+                                id: input.id || '',
+                                name: input.name || '',
+                                type: input.tagName.toLowerCase() === 'input' ? input.type : input.tagName.toLowerCase(),
+                                label: labelText.replace(/\\n/g, ' ').trim(),
+                                required: isRequired
+                            });
+                        }
+                    }
+                });
+                return results;
+            }""")
+            
+            if unfilled_fields:
+                # Build fallback structure
+                fallback_structure = "\n".join([f"- {f['label']}{' (REQUIRED)' if f['required'] else ''} | ID: {f['id']} | Type: {f['type']}" for f in unfilled_fields])
+                prompt = prompt_mod.build_gemini_fill_prompt(job, fallback_structure)
                 
-                # Try to fill based on type
-                selector = f'[id="{fid}"]'
-                el = page.query_selector(selector)
-                if not el: continue
+                # Cost Cap Enforcement
+                estimated_tokens = len(prompt) / 4
+                estimated_cost = (estimated_tokens / 1_000_000) * 0.10
                 
+                if estimated_cost > 0.05:
+                    add_event(f"[W{worker_id}] ABORT: Estimated cost ${estimated_cost:.4f} > $0.05 cap.")
+                    return "failed:application too expensive", int((time.time() - start) * 1000), json.dumps(application_details)
+
+                update_state(worker_id, last_action="Gemini fallback", actions=3)
+                llm = get_client()
+                response = llm.ask(prompt)
+                
+                # Parse JSON
                 try:
-                    el.scroll_into_view_if_needed()
-                    tag = el.evaluate("e => e.tagName.toLowerCase()")
-                    etype = el.evaluate("e => e.type")
+                    json_str = response.strip()
+                    if "```json" in json_str:
+                        json_str = json_str.split("```json")[1].split("```")[0].strip()
+                    elif "```" in json_str:
+                        json_str = json_str.split("```")[1].split("```")[0].strip()
                     
-                    if tag == "select":
-                        el.select_option(label=str(value))
-                    elif etype == "checkbox":
-                        is_checked = value is True or str(value).lower() in ("true", "yes", "checked")
-                        if is_checked:
-                            el.check(force=True)
-                        else:
-                            el.uncheck(force=True)
-                    elif etype == "radio":
-                        el.check(force=True)
-                    else:
-                        # For Greenhouse 'remix' inputs, sometimes fill() fails if hidden.
-                        # We try fill() first, then fallback to type()
+                    fb_map = json.loads(json_str)
+                    
+                    # Fill fallback fields
+                    for fid, data in fb_map.items():
+                        if not fid or not isinstance(data, dict): continue
+                        
+                        value = data.get("value")
+                        label = data.get("label", fid)
+                        
+                        if value == "PDF_RESUME_UPLOAD":
+                            if resume_path.exists():
+                                try:
+                                    page.locator(f'[id="{fid}"]').set_input_files(str(resume_path))
+                                    application_details[label] = str(resume_path)
+                                except Exception as e:
+                                    add_event(f"[W{worker_id}] LLM Resume Upload Error: {str(e)[:40]}")
+                            continue
+
+                        selector = f'[id="{fid}"]'
+                        el = page.query_selector(selector)
+                        if not el: continue
+                        
                         try:
-                            el.fill(str(value), timeout=2000)
-                        except:
-                            el.focus()
-                            page.keyboard.type(str(value), delay=20)
-                    
-                    page.wait_for_timeout(200) # Small breather between fields
-                except Exception as fe:
-                    add_event(f"[W{worker_id}] Warning: Could not fill {fid}: {str(fe)[:40]}")
-            
+                            el.scroll_into_view_if_needed()
+                            tag = el.evaluate("e => e.tagName.toLowerCase()")
+                            etype = el.evaluate("e => e.type")
+                            
+                            if tag == "select":
+                                el.select_option(label=str(value))
+                            elif etype == "checkbox":
+                                if value is True or str(value).lower() in ("true", "yes", "checked"):
+                                    el.check(force=True)
+                                else:
+                                    el.uncheck(force=True)
+                            elif etype == "radio":
+                                el.check(force=True)
+                            else:
+                                el.fill(str(value))
+                            
+                            application_details[label] = value
+                            page.wait_for_timeout(100)
+                        except Exception as fe:
+                            add_event(f"[W{worker_id}] Warning: Could not fill {fid}: {str(fe)[:40]}")
+                except Exception as pe:
+                    add_event(f"[W{worker_id}] Gemini response parse error: {str(pe)[:40]}")
+
             # 5. Submit
             duration_ms = int((time.time() - start) * 1000)
-            if dry_run:
-                add_event(f"[W{worker_id}] DRY RUN: Form filled, skipping submit.")
-                update_state(worker_id, status="applied", last_action="DRY RUN OK")
-                return "applied", duration_ms
+            details_json = json.dumps(application_details)
+
+            # Safeguard: Do not submit (or report success) if no fields were populated
+            if len(application_details) == 0:
+                add_event(f"[W{worker_id}] FAILED: 0 fields populated (possible captcha or unseen blocking element).")
+                return "failed:no_fields_populated", duration_ms, details_json
             
-            update_state(worker_id, last_action="submitting", actions=3)
-            # Find Greenhouse submit button (usually id="submit_app" or similar)
+            if dry_run:
+                add_event(f"[W{worker_id}] DRY RUN: {len(application_details)} fields populated.")
+                update_state(worker_id, status="applied", last_action="DRY RUN OK")
+                return "applied", duration_ms, details_json
+            
+            update_state(worker_id, last_action="submitting", actions=4)
             submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']")
             if submit_btn:
                 submit_btn.click()
-                page.wait_for_timeout(5000) # Wait for navigation or message
+                page.wait_for_timeout(5000)
                 
-                # Check for success
                 success_indicators = ["thank you", "received", "submitted", "application confirmation"]
                 content = page.content().lower()
                 if any(ind in content for ind in success_indicators):
                     add_event(f"[W{worker_id}] APPLIED: Success indicator found.")
                     update_state(worker_id, status="applied", last_action="Applied!")
-                    return "applied", duration_ms
+                    return "applied", duration_ms, details_json
                 else:
                     add_event(f"[W{worker_id}] Warning: No clear success message found.")
-                    return "applied", duration_ms # Assume success if no error shown
+                    return "applied", duration_ms, details_json
             else:
                 add_event(f"[W{worker_id}] FAILED: Could not find submit button.")
-                return "failed:no_submit_button", duration_ms
+                return "failed:no_submit_button", duration_ms, details_json
 
         except Exception as e:
-            logger.exception("Gemini apply error")
+            logger.exception("Apply error")
             duration_ms = int((time.time() - start) * 1000)
-            return f"failed:{str(e)[:100]}", duration_ms
+            return f"failed:{str(e)[:100]}", duration_ms, json.dumps(application_details)
         finally:
-            # We don't close the browser here, cleanup_worker does it
             pass
 
 
@@ -448,7 +546,7 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None]:
     """Execute a job application session."""
     return run_job_gemini(job, port, worker_id, model=model, dry_run=dry_run)
 
@@ -497,7 +595,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Gemini model name.
         dry_run: Don't click Submit.
         custom_sql: Custom SQL query for job selection.
         continuous: Run forever, polling for new jobs.
@@ -542,15 +640,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+            result, duration_ms, details_json = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
+            
+            # Update cumulative cost from LLM client
+            llm_client = get_client()
+            update_state(worker_id, total_cost=llm_client.total_cost)
 
             if result == "skipped":
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
+                mark_result(job["url"], "applied", duration_ms=duration_ms, application_details=details_json)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
@@ -558,7 +660,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
+                            duration_ms=duration_ms,
+                            application_details=details_json)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
@@ -592,9 +695,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = True, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1, custom: bool = False) -> None:
+         poll_interval: int = 60, workers: int = 1, custom: bool = False,
+         custom_sql: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -602,12 +706,13 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Gemini model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
         custom: Use custom SQL query from test/custom_records.sql.
+        custom_sql: Pre-loaded custom SQL string.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -616,22 +721,27 @@ def main(limit: int = 1, target_url: str | None = None,
     config.ensure_dirs()
     console = Console()
 
-    # Load and validate custom SQL
-    custom_sql = None
-    if custom:
+    # Load and validate custom SQL if not provided
+    if custom and not custom_sql:
         from applypilot.database import validate_and_load_custom_sql
         custom_sql = validate_and_load_custom_sql()
 
-        # Additional check for apply stage: application_url presence
+    if custom_sql:
+        # Check how many jobs in the custom subset are actually ready to apply
         conn = get_connection()
-        sample_rows = conn.execute(custom_sql).fetchall()
-        for row in sample_rows:
-            if not row["application_url"]:
-                console.print(f"[red]Error: Custom SQL returned rows with empty application_url.[/red]")
-                console.print(f"Row URL: {row['url']}")
-                sys.exit(1)
+        rows = conn.execute(f"WITH subset AS ({custom_sql}) SELECT * FROM subset WHERE fit_score >= ?", (min_score,)).fetchall()
+        
+        ready_count = sum(1 for r in rows if r["application_url"])
+        missing_url = sum(1 for r in rows if not r["application_url"])
+        
+        if ready_count == 0 and missing_url > 0:
+            console.print(f"[yellow]Warning: {missing_url} jobs found with score >= {min_score}, but NONE have an application_url.[/yellow]")
+            console.print("[dim]Run 'applypilot run enrich --custom' first to retrieve apply URLs.[/dim]")
+        elif missing_url > 0:
+            console.print(f"[dim]Note: {missing_url} jobs in subset lack an application_url and will be skipped.[/dim]")
 
-        console.print(f"[green]Custom SQL validated ({len(sample_rows)} jobs in pool).[/green]")
+        if ready_count > 0:
+            console.print(f"[green]Custom SQL validated ({ready_count} jobs ready to apply).[/green]")
 
     if continuous:
         effective_limit = 0
@@ -656,7 +766,7 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # No-op here as Claude Code is removed
+            # No-op here as Gemini Code is removed
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()

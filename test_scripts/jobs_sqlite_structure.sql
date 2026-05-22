@@ -39,5 +39,6 @@ CREATE TABLE jobs (
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            application_details, TEXT
         )

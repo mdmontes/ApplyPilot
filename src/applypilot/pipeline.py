@@ -126,7 +126,7 @@ def _run_score(dry_run: bool = False, custom_sql: str | None = None, force: bool
         return {"status": f"error: {e}"}
 
 
-def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False, custom: bool = False) -> dict:
+def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False, custom: bool = False, custom_sql: str | None = None) -> dict:
     """Stage: Auto-apply — autonomous browser submission."""
     try:
         from applypilot.apply.launcher import main as apply_main
@@ -136,6 +136,7 @@ def _run_apply(min_score: int = 7, workers: int = 1, dry_run: bool = False, cust
             workers=workers,
             dry_run=dry_run,
             custom=custom,
+            custom_sql=custom_sql,
         )
         return {"status": "ok"}
     except Exception as e:

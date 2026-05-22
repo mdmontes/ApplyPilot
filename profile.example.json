@@ -47,7 +47,8 @@
   "resume_facts": {
     "preserved_companies": ["Company A", "Company B"],
     "preserved_projects": ["Project X", "Project Y"],
-    "preserved_school": "Your University",
+    "preserved_school": {
+      "preserved_school": "University of North Carolina at Chapel Hill","graduation_dates": "08/2009-05/2013"},
     "real_metrics": ["50% improvement", "10x faster"]
   },
   "eeo_voluntary": {
@@ -55,5 +56,6 @@
     "race_ethnicity": "Decline to self-identify",
     "veteran_status": "Decline to self-identify",
     "disability_status": "Decline to self-identify"
-  }
+  },
+  "why_i_want_to_work_here": "I am really interested in the possibility of working with top tier professionals in the tech space. I have a great passion for data engineering, coding, and building creative new technologies. I think I would be able to exercise that passion with this company at this role."
 }

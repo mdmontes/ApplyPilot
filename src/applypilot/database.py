@@ -73,7 +73,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
-                   verification_confidence
+                   verification_confidence, application_details
 
     Args:
         db_path: Override the default DB_PATH.
@@ -129,7 +129,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            application_details   TEXT
         )
     """)
     conn.commit()
@@ -180,6 +181,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    "application_details": "TEXT",
 }
 
 

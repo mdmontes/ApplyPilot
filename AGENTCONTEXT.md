@@ -75,7 +75,7 @@ The `jobs` table in SQLite acts as the central state machine for the pipeline. E
 | **Discover** | N/A (Initial Entry) | Search Config, Site Registries | `url`, `title`, `site`, `location`, `description` |
 | **Enrich** | `detail_scraped_at IS NULL` | `url` | `full_description`, `application_url`, `detail_scraped_at` |
 | **Score** | `full_description IS NOT NULL` AND `fit_score IS NULL` | `full_description`, Resume/Profile | `fit_score`, `score_reasoning`, `scored_at` |
-| **Apply** | `fit_score >= {min}` AND `applied_at IS NULL` | `application_url`, `title`, Profile Data | `applied_at`, `apply_status`, `apply_error`, `apply_attempts` |
+| Apply | `fit_score >= {min}` AND `applied_at IS NULL` | `application_url`, `title`, Profile Data | `applied_at`, `apply_status`, `apply_error`, `apply_attempts`, `application_details` |
 
 ### Key Gates & Logic
 The pipeline uses specific columns to "gate" jobs between stages. These gates can be bypassed or restricted using flags. 
@@ -90,10 +90,19 @@ The pipeline uses specific columns to "gate" jobs between stages. These gates ca
     - **Bypass Gate (Re-score)**: Use `--force` (or `-f`) to ignore existing scores and re-evaluate.
     - **Example**: `applypilot run score --custom --force`
 - **Apply Gate (Min Score)**: Eligible if `fit_score >= {min_score}` AND `applied_at IS NULL`.
+    - **Zero-DOM Strategy**: Uses high-speed JS injection for standard fields and surgical Gemini fallback for required custom questions.
+    - **Headless Default**: All apply commands now run headless by default for stability and background execution.
+    - **Flexible Flag Ordering**: For both `run apply` and standalone `apply`, flags like `--custom` (`-c`), `--min-score`, and `--dry-run` can be placed in any order.
+    - **Note on Short Flags**: In the standalone `apply` command, `-c` is used for `--custom`. Use `-C` for `--continuous`.
     - **Restrict to Subset**: Use `--custom` (or `-c`) to only apply to jobs from `@test/custom_records.sql`.
+    - **Dry Run**: Use `--dry-run` to populate fields and log `application_details` without submitting.
     - **Override Score Threshold**: Use `--min-score {number}` to lower/raise the bar (default: 7).
-    - **Example**: `applypilot run apply --custom --min-score 5`
+    - **Examples**: 
+        - `applypilot run apply --custom --min-score 5 --dry-run`
+        - `applypilot run apply --min-score 6 -c`
+        - `applypilot apply --dry-run --min-score 5 -c`
 - **Data Presence**: The `application_url` must be present (populated during Enrichment) before a job can be applied to.
+
 
 ## Limitations & Considerations
 As an AI agent operating within this workspace, my capabilities and limitations are defined as follows:

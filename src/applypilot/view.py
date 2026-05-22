@@ -76,7 +76,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, application_details
         FROM jobs
         WHERE fit_score >= 5
         ORDER BY fit_score DESC, site, title
@@ -164,6 +164,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
         full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
         desc_len = len(j["full_description"] or "")
 
+        app_details_raw = j["application_details"] or ""
+        app_details_html = ""
+        if app_details_raw:
+            try:
+                import json
+                details_dict = json.loads(app_details_raw)
+                # Format as a simple list of key: value
+                formatted_details = "<br>".join([f"<b>{escape(k)}</b>: {escape(str(v))}" for k, v in details_dict.items()])
+                app_details_html = f"<details class='full-desc-details'><summary class='expand-btn'>Application Details ({len(details_dict)} fields)</summary><div class='full-desc'>{formatted_details}</div></details>"
+            except:
+                app_details_html = f"<details class='full-desc-details'><summary class='expand-btn'>Application Details (Raw)</summary><div class='full-desc'>{escape(app_details_raw)}</div></details>"
+
         meta_parts = []
         meta_parts.append(
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
@@ -189,6 +201,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
           <p class="desc-preview">{desc_preview}...</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
+          {app_details_html}
           <div class="card-footer">{apply_html}</div>
         </div>"""
 
