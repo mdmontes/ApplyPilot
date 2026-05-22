@@ -199,17 +199,31 @@ Company: {job.get('site', 'Unknown')}
 {form_structure}
 
 == INSTRUCTIONS ==
-1. Carefully analyze the form structure provided.
-2. For each relevant field (input, select, textarea), determine the best value from the candidate's profile.
-3. For standard questions (First Name, Email, Phone, LinkedIn, GitHub, Website), map them accurately.
-4. For Work Authorization, EEOC (Gender, Race, Veteran, Disability), and Clearance questions, use the profile to provide honest and consistent answers.
-5. For the resume upload field (usually id="resume" or type="file"), use the string "PDF_RESUME_UPLOAD" as the value.
-6. If a field is required (*) and you don't have a specific value, provide a reasonable default (e.g., "N/A" or "0").
-7. Return a JSON object where keys are the EXACT HTML IDs provided, and values are nested objects containing "value" and "label".
-8. The "label" MUST be the human-readable question or field name found in the form structure.
+1. MANDATORY FIRST STEP: Identify the submission button in the form structure. If you cannot find a way to submit the form, do not attempt to map any fields; instead, return a JSON object with only the "llm_found_submit": "submit_not_found" key.
+2. Carefully analyze the form structure provided.
+3. For each relevant field (input, select, textarea), determine the best value from the candidate's profile.
+4. For standard questions (First Name, Email, Phone, LinkedIn, GitHub, Website), map them accurately.
+5. For Work Authorization, EEOC (Gender, Race, Veteran, Disability), and Clearance questions, use the profile to provide honest and consistent answers.
+6. For the resume upload field (usually id="resume" or type="file"), use the string "PDF_RESUME_UPLOAD" as the value.
+7. VERY IMPORTANT: NEVER provide a value or mapping for "Cover Letter" fields. They should always be ignored.
+8. ALWAYS answer "No" to any questions asking if the candidate has worked at the hiring company before, is a former employee, or has previously been employed by this organization.
+9. ALWAYS answer "Yes" or consent to any questions regarding Privacy Policies, Data Processing, or Applicant Privacy Notices.
+10. For questions about working "On-site", "Hybrid", or "Relocation", answer "Yes" ONLY if the job location is in North Carolina, USA. Otherwise, answer "No".
+11. ALWAYS set pronouns to "he/him" if asked.
+12. ALWAYS state that the candidate is based in the "United States" (or USA/US) if asked where they are based, where they reside, or their current location. Use the specific city/state from the profile if a more granular location is required, but ensure the country is clearly the United States.
+13. For questions asking how the candidate heard about the job or the source of their application, ALWAYS answer "From the company jobs site" or select the equivalent option if a list is provided.
+14. If a field is required (*) and you don't have a specific value, provide a reasonable default (e.g., "N/A" or "0").
+15. IDENTIFY THE SUBMIT BUTTON: Confirm the exact ID or selector of the submission button.
+16. REPORT SUBMISSION STATUS: Include a special top-level key in your JSON response named "llm_found_submit". Assign it one of the following values:
+    - "submit_not_found": If you cannot identify a clear submission button.
+    - "submit_found_not_pressed": If you identified a submission button but are NOT instructing to press it (standard mapping phase or dry-run).
+    - "submit_pressed": If you identified the button and instructions indicate it should be pressed.
+17. Return a JSON object where keys are the EXACT HTML IDs provided, and values are nested objects containing "value" and "label".
+18. The "label" MUST be the human-readable question or field name found in the form structure.
 
 Example output:
 {{
+  "llm_found_submit": "submit_found_not_pressed",
   "first_name": {{
     "value": "John",
     "label": "First Name"

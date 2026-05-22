@@ -37,6 +37,7 @@ from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
 )
+from applypilot.apply.check_propulatedapp_prompt import check_prepopulated_app
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url,
-                       fit_score, location, full_description
+                       fit_score, location, full_description,
+                       application_schema
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND (apply_status IS NULL OR apply_status != 'in_progress')
@@ -108,7 +110,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 query = f"""
                     WITH custom_subset AS ({custom_sql})
                     SELECT url, title, site, application_url,
-                           fit_score, location, full_description
+                           fit_score, location, full_description,
+                           application_schema
                     FROM custom_subset
                     WHERE (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
@@ -120,7 +123,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             else:
                 query = """
                     SELECT url, title, site, application_url,
-                           fit_score, location, full_description
+                           fit_score, location, full_description,
+                           application_schema
                     FROM jobs
                     WHERE (apply_status IS NULL OR apply_status = 'failed')
                       AND (apply_attempts IS NULL OR apply_attempts < ?)
@@ -164,7 +168,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None,
-                application_details: str | None = None) -> None:
+                application_details: str | None = None,
+                application_prepopulated: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
@@ -173,18 +178,29 @@ def mark_result(url: str, status: str, error: str | None = None,
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
-                           application_details = ?
+                           application_details = ?,
+                           application_prepopulated = ?
             WHERE url = ?
-        """, (now, duration_ms, task_id, application_details, url))
+        """, (now, duration_ms, task_id, application_details, application_prepopulated, url))
     else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
-            UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?,
-                           application_details = ?
-            WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, application_details, url))
+        if permanent:
+            conn.execute("""
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = 99, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?,
+                               application_details = ?,
+                               application_prepopulated = ?
+                WHERE url = ?
+            """, (status, error or "unknown", duration_ms, task_id, application_details, application_prepopulated, url))
+        else:
+            conn.execute("""
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = COALESCE(apply_attempts, 0) + 1, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?,
+                               application_details = ?,
+                               application_prepopulated = ?
+                WHERE url = ?
+            """, (status, error or "unknown", duration_ms, task_id, application_details, application_prepopulated, url))
     conn.commit()
 
 
@@ -231,6 +247,143 @@ def gen_prompt(target_url: str, min_score: int = 7,
     mcp_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     return prompt_file
+
+
+def prepopulate_app(job: dict, profile: dict) -> list[dict]:
+    """Compare application_schema against profile.json to create a prepopulated map.
+    
+    Returns a list of question maps with applicant_answer.
+    """
+    schema_str = job.get("application_schema")
+    if not schema_str:
+        return []
+        
+    try:
+        schema = json.loads(schema_str)
+    except Exception:
+        return []
+
+    # Flatten questions from different sections
+    all_questions = []
+    if isinstance(schema, list):
+        all_questions = schema
+    elif isinstance(schema, dict):
+        if "questions" in schema and isinstance(schema["questions"], list):
+            all_questions.extend(schema["questions"])
+        if "compliance" in schema and isinstance(schema["compliance"], list):
+            for comp in schema["compliance"]:
+                if "questions" in comp and isinstance(comp["questions"], list):
+                    all_questions.extend(comp["questions"])
+        if "demographic_questions" in schema and isinstance(schema["demographic_questions"], list):
+            all_questions.extend(schema["demographic_questions"])
+        
+        # Fallback: if dict has no known keys but has 'label' or 'id', it might be a single question
+        if not all_questions and ("label" in schema or "id" in schema or "fields" in schema):
+            all_questions = [schema]
+
+    prepopulated = []
+    personal = profile.get("personal", {})
+    work_auth = profile.get("work_authorization", {})
+    eeo = profile.get("eeo_voluntary", {})
+    exp = profile.get("experience", {})
+    comp = profile.get("compensation", {})
+
+    for q in all_questions:
+        if not isinstance(q, dict): continue
+        
+        label = q.get("label", "")
+        required = q.get("required", False)
+        fields = q.get("fields", [])
+        
+        # Normalize: if no fields list, treat the question itself as a field
+        if not fields:
+            fid = q.get("id") or q.get("name")
+            if fid:
+                fields = [{"name": fid, "type": q.get("type", "input_text")}]
+                # Preserve existing answer if any
+                if "applicant_answer" in q:
+                    fields[0]["applicant_answer"] = q["applicant_answer"]
+            elif label:
+                # Last resort: generate a synthetic ID from label
+                fid = "field_" + "".join(filter(str.isalnum, label.lower()))[:20]
+                fields = [{"name": fid, "type": "input_text"}]
+        
+        for f in fields:
+            if not isinstance(f, dict): continue
+            
+            fid = f.get("name", f.get("id", ""))
+            ftype = f.get("type", "")
+            
+            # Start with existing answer if available, else default to not found
+            answer = f.get("applicant_answer", q.get("applicant_answer", "answer_not_found"))
+            
+            # Basic mapping logic (only overwrite if we don't already have a real answer)
+            if answer in ("answer_not_found", "do_not_fill", "", None):
+                low_label = label.lower()
+                if "cover letter" in low_label:
+                    answer = "do_not_fill"
+                elif "first name" in low_label:
+                    answer = personal.get("full_name", "").split()[0] if personal.get("full_name") else "answer_not_found"
+                elif "last name" in low_label:
+                    name_parts = personal.get("full_name", "").split()
+                    answer = name_parts[-1] if len(name_parts) > 1 else "answer_not_found"
+                elif "email" in low_label:
+                    answer = personal.get("email", "answer_not_found")
+                elif "phone" in low_label:
+                    answer = personal.get("phone", "answer_not_found")
+                elif "linkedin" in low_label:
+                    answer = personal.get("linkedin_url", "answer_not_found")
+                elif "github" in low_label:
+                    answer = personal.get("github_url", "answer_not_found")
+                elif "website" in low_label:
+                    answer = personal.get("website_url", "answer_not_found")
+                elif "resume" in low_label or ftype == "input_file":
+                     answer = str(config.RESUME_PDF_PATH)
+                elif "visa" in low_label or "sponsor" in low_label:
+                    answer = "No" if not work_auth.get("require_sponsorship") else "Yes"
+                elif "authorized" in low_label:
+                    answer = "Yes" if work_auth.get("legally_authorized_to_work") else "No"
+                elif "worked at" in low_label and ("this company" in low_label or "previously" in low_label or "hiring company" in low_label):
+                    answer = "No"
+                elif "former" in low_label and "employee" in low_label:
+                    answer = "No"
+                elif "privacy" in low_label or "consent" in low_label or "policy" in low_label:
+                    answer = "Yes"
+                elif "onsite" in low_label or "on-site" in low_label or "hybrid" in low_label or "relocate" in low_label:
+                    job_loc = (job.get("location") or "").lower()
+                    if "nc" in job_loc or "north carolina" in job_loc:
+                        answer = "Yes"
+                    else:
+                        answer = "No"
+                elif "salary" in low_label:
+                    answer = comp.get("salary_expectation", "answer_not_found")
+                elif "based" in low_label or "location" in low_label or "country" in low_label or "reside" in low_label:
+                    answer = personal.get("country") or personal.get("city", "") + ", " + personal.get("province_state", "")
+                    if not answer or answer.strip() == ",":
+                        answer = "United States"
+                elif "pronoun" in low_label:
+                    answer = "he/him"
+                elif "hear about" in low_label or "referral" in low_label or "source" in low_label:
+                    answer = "From the company jobs site"
+                elif "gender" in low_label:
+
+                    answer = eeo.get("gender", "answer_not_found")
+                elif "race" in low_label:
+                    answer = eeo.get("race_ethnicity", "answer_not_found")
+                elif "veteran" in low_label:
+                    answer = eeo.get("veteran_status", "answer_not_found")
+                elif "disability" in low_label:
+                    answer = eeo.get("disability_status", "answer_not_found")
+
+            prepopulated.append({
+                "id": fid,
+                "label": label,
+                "required": required,
+                "type": ftype,
+                "applicant_answer": answer
+            })
+            
+    return prepopulated
 
 
 def mark_job(url: str, status: str, reason: str | None = None) -> None:
@@ -281,17 +434,51 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job_gemini(job: dict, port: int, worker_id: int = 0,
-                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None]:
-    """Execute a one-shot job application using Partial-DOM + Gemini fallback."""
+                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
+    """Execute a one-shot job application using Prepopulated-Schema + Gemini fallback."""
     start = time.time()
-    application_details = {}
+    
+    # 0. Prepopulate & Check
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=start, actions=0, last_action="navigating")
-    add_event(f"[W{worker_id}] Starting (Partial-DOM): {job['title'][:40]} @ {job.get('site', '')}")
+                 start_time=start, actions=0, last_action="prepopulating")
+    
+    schema_str = job.get("application_schema")
+    if not schema_str:
+        add_event(f"[W{worker_id}] FAILED: No application_schema found.")
+        return "failed:missing_application_schema", 0, None, None
+
+    profile = config.load_profile()
+    prepopulated_map = prepopulate_app(job, profile)
+    if prepopulated_map:
+        add_event(f"[W{worker_id}] Prepopulated local map ({len(prepopulated_map)} fields)")
+        
+        # IMMEDIATELY save initial mapping to database
+        conn = get_connection()
+        conn.execute(
+            "UPDATE jobs SET application_prepopulated = ? WHERE url = ?",
+            (json.dumps(prepopulated_map), job["url"])
+        )
+        conn.commit()
+
+        # Activate LLM check
+        prepopulated_map = check_prepopulated_app(job, profile, prepopulated_map)
+        
+        # Save verified prepopulated map to database (pre-apply state)
+        conn.execute(
+            "UPDATE jobs SET application_prepopulated = ? WHERE url = ?",
+            (json.dumps(prepopulated_map), job["url"])
+        )
+        conn.commit()
+        
+        add_event(f"[W{worker_id}] LLM verified prepopulated map")
+    else:
+        add_event(f"[W{worker_id}] FAILED: Could not prepopulate map from schema.")
+        return "failed:empty_application_schema", 0, None, None
+    
+    add_event(f"[W{worker_id}] Starting (Schema-Based): {job['title'][:40]} @ {job.get('site', '')}")
 
     url = job.get("application_url") or job["url"]
-    profile = config.load_profile()
     
     with sync_playwright() as p:
         try:
@@ -299,53 +486,44 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
             context = browser.contexts[0]
             page = context.new_page()
             
-            # 1. Navigate
-            page.goto(url, wait_until="networkidle", timeout=60000)
-            update_state(worker_id, last_action="Identifying form context", actions=1)
-            
-            # 2. Robust Programmatic Injection
-            static_field_map = {
-                "first_name": profile["personal"].get("full_name", "").split()[0],
-                "last_name": profile["personal"].get("full_name", "").split()[-1] if " " in profile["personal"].get("full_name", "") else "",
-                "email": profile["personal"].get("email", ""),
-                "phone": profile["personal"].get("phone", ""),
-                "org": profile["experience"].get("current_company", profile["experience"].get("current_title", "")),
-                "linkedin": profile["personal"].get("linkedin_url", ""),
-                "github": profile["personal"].get("github_url", ""),
-                "website": profile["personal"].get("website_url", ""),
-                "portfolio": profile["personal"].get("portfolio_url", "")
-            }
+            # 1. Navigate with robust wait
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as ge:
+                add_event(f"[W{worker_id}] Warning: Initial navigation error: {str(ge)[:40]}")
 
+            try:
+                # Wait for universal form elements or a short timeout to ensure hydration
+                page.wait_for_selector("button[type='submit'], input[type='submit'], input[type='file'], #first_name, #last_name, #email", timeout=20000)
+            except:
+                # Fallback: just wait a few seconds if selectors don't appear (might be a weird site)
+                page.wait_for_timeout(5000)
+            
+            update_state(worker_id, last_action="Injecting prepopulated data", actions=1)
+            
+            # 2. Prepopulated Injection
             injection_script = """
-            (profileStr) => {
-                const data = JSON.parse(profileStr);
-                const mappings = [
-                    { key: 'first_name', label: 'First Name', selectors: ['#first_name', 'input[name="first_name"]', 'input[autocomplete="given-name"]'] },
-                    { key: 'last_name', label: 'Last Name', selectors: ['#last_name', 'input[name="last_name"]', 'input[autocomplete="family-name"]'] },
-                    { key: 'email', label: 'Email', selectors: ['#email', 'input[name="email"]', 'input[type="email"]', 'input[autocomplete="email"]'] },
-                    { key: 'phone', label: 'Phone', selectors: ['#phone', 'input[name="phone"]', 'input[type="tel"]', 'input[autocomplete="tel"]'] },
-                    { key: 'org', label: 'Company', selectors: ['#org', 'input[name="org"]', 'input[name="company"]'] },
-                    { key: 'linkedin', label: 'LinkedIn', selectors: ['#urls\\\\[LinkedIn\\\\]', 'input[name*="linkedin"]'] },
-                    { key: 'github', label: 'GitHub', selectors: ['#urls\\\\[GitHub\\\\]', 'input[name*="github"]'] },
-                    { key: 'website', label: 'Website', selectors: ['#urls\\\\[Website\\\\]', 'input[name*="website"]'] },
-                    { key: 'portfolio', label: 'Portfolio', selectors: ['#urls\\\\[Portfolio\\\\]', 'input[name*="portfolio"]'] }
-                ];
-                
+            (mapStr) => {
+                const prepopulated = JSON.parse(mapStr);
                 let results = {};
-                for (const m of mappings) {
-                    const value = data[m.key];
-                    if (!value) continue;
+                let failed = [];
+                
+                for (const item of prepopulated) {
+                    const fid = item.id;
+                    const value = item.applicant_answer;
+                    const label = item.label;
                     
-                    let el = null;
-                    for (const s of m.selectors) {
-                        el = document.querySelector(s);
-                        if (el) break;
+                    if (value === "answer_not_found" || value === "PDF_RESUME_UPLOAD" || value === "do_not_fill") {
+                        failed.push(item);
+                        continue;
                     }
                     
-                    // Fallback: search by label text
+                    let el = document.getElementById(fid) || document.querySelector(`[name="${fid}"]`);
+                    
+                    // Fallback for labels
                     if (!el) {
                         const labels = Array.from(document.querySelectorAll('label'));
-                        const targetLabel = labels.find(l => l.innerText.toLowerCase().includes(m.label.toLowerCase()));
+                        const targetLabel = labels.find(l => l.innerText.toLowerCase().includes(label.toLowerCase()));
                         if (targetLabel && targetLabel.htmlFor) {
                             el = document.getElementById(targetLabel.htmlFor);
                         }
@@ -355,98 +533,114 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
                     }
 
                     if (el) {
-                        el.value = value;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        results[m.label] = value;
+                        try {
+                            if (el.tagName === 'SELECT') {
+                                const options = Array.from(el.options);
+                                const targetOpt = options.find(o => o.text.toLowerCase().includes(value.toLowerCase()) || o.value === value);
+                                if (targetOpt) {
+                                    el.value = targetOpt.value;
+                                } else {
+                                    el.value = value;
+                                }
+                            } else if (el.type === 'checkbox' || el.type === 'radio') {
+                                if (value === true || value === "Yes" || value === "true" || value === "Checked") {
+                                    el.checked = true;
+                                } else {
+                                    el.checked = false;
+                                }
+                            } else if (el.type !== 'file') {
+                                el.value = value;
+                            }
+                            
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            results[fid] = value;
+                        } catch (e) {
+                            failed.push(item);
+                        }
+                    } else {
+                        failed.push(item);
                     }
                 }
-                return results;
+                return { results, failed };
             }
             """
             
-            programmatic_filled = page.evaluate(injection_script, json.dumps(static_field_map))
-            application_details.update(programmatic_filled)
+            inject_res = page.evaluate(injection_script, json.dumps(prepopulated_map))
+            # Update map with results
+            for item in prepopulated_map:
+                if item["id"] in inject_res["results"]:
+                    item["applicant_answer"] = inject_res["results"][item["id"]]
             
-            # 3. Initial Programmatic Resume Upload
+            failed_fields = inject_res["failed"]
+            
+            # 3. Resume Upload (Always)
             resume_path = config.RESUME_PDF_PATH
-            resume_uploaded = False
             if resume_path.exists():
-                # Try common Greenhouse ID and generic selectors
-                resume_selectors = ["input[type='file'][id='job_application_resume']", "input[type='file'][name*='resume']"]
+                resume_selectors = ["input[type='file'][id='job_application_resume']", "input[type='file'][name*='resume']", "input[type='file']"]
                 for sel in resume_selectors:
-                    input_el = page.locator(sel)
-                    if input_el.count() > 0:
-                        input_el.set_input_files(str(resume_path))
-                        application_details["Resume/CV"] = str(resume_path)
-                        resume_uploaded = True
-                        break
-            
-            # 4. LLM Fallback with Cost Cap
-            update_state(worker_id, last_action="evaluating missing fields", actions=2)
-            
-            # Capture all unfilled fields (not just required, to maximize quality)
-            unfilled_fields = page.evaluate("""() => {
-                const results = [];
-                const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
-                inputs.forEach(input => {
-                    const style = window.getComputedStyle(input);
-                    if (input.type === 'hidden' || style.display === 'none' || style.visibility === 'hidden') return;
-                    if (input.type === 'submit' || input.type === 'button') return;
-                    
-                    // Only process if currently empty
-                    if (!input.value || (input.type === 'file' && input.files.length === 0)) {
-                        let labelText = '';
-                        if (input.id) {
-                            const label = document.querySelector(`label[for="${input.id}"]`);
-                            if (label) labelText = label.innerText;
-                        }
-                        if (!labelText) {
-                            const parentLabel = input.closest('label');
-                            if (parentLabel) labelText = parentLabel.innerText;
-                        }
-                        if (!labelText) labelText = input.getAttribute('aria-label') || input.placeholder || '';
+                    try:
+                        input_el = page.locator(sel)
+                        if input_el.count() > 0:
+                            input_el.set_input_files(str(resume_path))
+                            for item in prepopulated_map:
+                                if "resume" in item["label"].lower() or item["type"] == "input_file":
+                                    item["applicant_answer"] = str(resume_path)
+                            break
+                    except:
+                        continue
 
-                        const isRequired = input.required || input.getAttribute('aria-required') === 'true' || 
-                                         input.closest('.required') || input.parentElement.innerText.includes('*');
-                        
-                        const isResumeField = input.type === 'file' || 
-                                           labelText.toLowerCase().includes('resume') || 
-                                           labelText.toLowerCase().includes('cv');
-
-                        // ALWAYS include resume/file fields, even if not required
-                        if (isRequired || isResumeField) {
-                            results.push({
-                                id: input.id || '',
-                                name: input.name || '',
-                                type: input.tagName.toLowerCase() === 'input' ? input.type : input.tagName.toLowerCase(),
-                                label: labelText.replace(/\\n/g, ' ').trim(),
-                                required: isRequired
-                            });
-                        }
+            # 4. LLM Fallback with Complexity Check
+            if failed_fields:
+                update_state(worker_id, last_action="LLM surgical fallback", actions=2)
+                
+                # Scan for submit button details to give to LLM
+                submit_info = page.evaluate("""() => {
+                    const btn = document.querySelector("#submit_app") || document.querySelector("button[type='submit']") || document.querySelector("input[type='submit']");
+                    if (btn) {
+                        return {
+                            id: btn.id || '',
+                            text: btn.innerText || btn.value || '',
+                            selector: btn.id ? `#${btn.id}` : (btn.tagName.toLowerCase() + (btn.type ? `[type='${btn.type}']` : ''))
+                        };
                     }
-                });
-                return results;
-            }""")
-            
-            if unfilled_fields:
+                    return null;
+                }""")
+                
                 # Build fallback structure
-                fallback_structure = "\n".join([f"- {f['label']}{' (REQUIRED)' if f['required'] else ''} | ID: {f['id']} | Type: {f['type']}" for f in unfilled_fields])
-                prompt = prompt_mod.build_gemini_fill_prompt(job, fallback_structure)
-                
-                # Cost Cap Enforcement
-                estimated_tokens = len(prompt) / 4
-                estimated_cost = (estimated_tokens / 1_000_000) * 0.10
-                
-                if estimated_cost > 0.05:
-                    add_event(f"[W{worker_id}] ABORT: Estimated cost ${estimated_cost:.4f} > $0.05 cap.")
-                    return "failed:application too expensive", int((time.time() - start) * 1000), json.dumps(application_details)
+                fallback_structure = "\n".join([f"- {f['label']}{' (REQUIRED)' if f['required'] else ''} | ID: {f['id']} | Type: {f['type']}" for f in failed_fields])
+                if submit_info:
+                    fallback_structure += f"\n\nSUBMISSION BUTTON DETECTED: ID={submit_info['id']}, Text='{submit_info['text']}', Recommended Selector={submit_info['selector']}"
+                else:
+                    fallback_structure += "\n\nWARNING: NO SUBMISSION BUTTON DETECTED BY AUTOMATION. PLEASE SEARCH THE DOM FOR ONE."
 
-                update_state(worker_id, last_action="Gemini fallback", actions=3)
                 llm = get_client()
+                
+                # Complexity Check
+                complexity_prompt = f"""You are an autonomous application agent. 
+Analyze the following required fields that were NOT successfully populated by automation.
+Determine if accurately populating these fields (potentially including finding them in the DOM and mapping answers) would take longer than 15 seconds.
+
+FIELDS TO POPULATE:
+{fallback_structure}
+
+Criteria for "TOO_COMPLEX":
+- More than 5 custom open-ended questions.
+- Questions requiring research into company-specific facts not in profile.
+- Extremely non-standard DOM structure (e.g. nested iframes, custom shadow DOMs).
+
+Respond with ONLY "OK" or "TOO_COMPLEX".
+"""
+                complexity_resp = llm.ask(complexity_prompt).strip().upper()
+                if "TOO_COMPLEX" in complexity_resp:
+                    add_event(f"[W{worker_id}] ABORT: Form too complex (>15s estimate)")
+                    final_data = {"questions": prepopulated_map, "llm_found_submit": "aborted_too_complex"}
+                    return "failed:application too complex", int((time.time() - start) * 1000), json.dumps(final_data), json.dumps(prepopulated_map)
+
+                # Surgical Fill
+                prompt = prompt_mod.build_gemini_fill_prompt(job, fallback_structure)
                 response = llm.ask(prompt)
                 
-                # Parse JSON
                 try:
                     json_str = response.strip()
                     if "```json" in json_str:
@@ -456,87 +650,93 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
                     
                     fb_map = json.loads(json_str)
                     
-                    # Fill fallback fields
+                    # Check for mandatory first step: Submit Button
+                    if fb_map.get("llm_found_submit") == "submit_not_found":
+                        add_event(f"[W{worker_id}] ABORT: LLM could not find submit button.")
+                        final_data = {"questions": prepopulated_map, "llm_found_submit": "submit_not_found"}
+                        return "failed:no_submit_button", int((time.time() - start) * 1000), json.dumps(final_data), json.dumps(prepopulated_map)
+
                     for fid, data in fb_map.items():
+                        if fid == "llm_found_submit": continue
                         if not fid or not isinstance(data, dict): continue
-                        
                         value = data.get("value")
-                        label = data.get("label", fid)
                         
-                        if value == "PDF_RESUME_UPLOAD":
-                            if resume_path.exists():
-                                try:
-                                    page.locator(f'[id="{fid}"]').set_input_files(str(resume_path))
-                                    application_details[label] = str(resume_path)
-                                except Exception as e:
-                                    add_event(f"[W{worker_id}] LLM Resume Upload Error: {str(e)[:40]}")
-                            continue
-
-                        selector = f'[id="{fid}"]'
-                        el = page.query_selector(selector)
-                        if not el: continue
+                        if value == "PDF_RESUME_UPLOAD": continue
                         
-                        try:
-                            el.scroll_into_view_if_needed()
-                            tag = el.evaluate("e => e.tagName.toLowerCase()")
-                            etype = el.evaluate("e => e.type")
-                            
-                            if tag == "select":
-                                el.select_option(label=str(value))
-                            elif etype == "checkbox":
-                                if value is True or str(value).lower() in ("true", "yes", "checked"):
-                                    el.check(force=True)
+                        el = page.query_selector(f'[id="{fid}"]') or page.query_selector(f'[name="{fid}"]')
+                        if el:
+                            try:
+                                el.scroll_into_view_if_needed()
+                                tag = el.evaluate("e => e.tagName.toLowerCase()")
+                                etype = el.evaluate("e => e.type")
+                                if tag == "select":
+                                    el.select_option(label=str(value))
+                                elif etype in ("checkbox", "radio"):
+                                    if value is True or str(value).lower() in ("true", "yes", "checked"):
+                                        el.check(force=True)
+                                    else:
+                                        el.uncheck(force=True)
                                 else:
-                                    el.uncheck(force=True)
-                            elif etype == "radio":
-                                el.check(force=True)
-                            else:
-                                el.fill(str(value))
-                            
-                            application_details[label] = value
-                            page.wait_for_timeout(100)
-                        except Exception as fe:
-                            add_event(f"[W{worker_id}] Warning: Could not fill {fid}: {str(fe)[:40]}")
-                except Exception as pe:
-                    add_event(f"[W{worker_id}] Gemini response parse error: {str(pe)[:40]}")
+                                    el.fill(str(value))
+                                for item in prepopulated_map:
+                                    if item["id"] == fid:
+                                        item["applicant_answer"] = value
+                                page.wait_for_timeout(100)
+                            except:
+                                pass
+                except:
+                    pass
 
-            # 5. Submit
+            # 5. Submit Tracking
             duration_ms = int((time.time() - start) * 1000)
-            details_json = json.dumps(application_details)
-
-            # Safeguard: Do not submit (or report success) if no fields were populated
-            if len(application_details) == 0:
-                add_event(f"[W{worker_id}] FAILED: 0 fields populated (possible captcha or unseen blocking element).")
-                return "failed:no_fields_populated", duration_ms, details_json
-            
-            if dry_run:
-                add_event(f"[W{worker_id}] DRY RUN: {len(application_details)} fields populated.")
-                update_state(worker_id, status="applied", last_action="DRY RUN OK")
-                return "applied", duration_ms, details_json
-            
-            update_state(worker_id, last_action="submitting", actions=4)
+            llm_found_submit = "submit_not_found"
             submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']")
             if submit_btn:
-                submit_btn.click()
-                page.wait_for_timeout(5000)
-                
-                success_indicators = ["thank you", "received", "submitted", "application confirmation"]
+                if dry_run:
+                    llm_found_submit = "submit_found_not_pressed"
+                else:
+                    try:
+                        submit_btn.click()
+                        page.wait_for_timeout(5000)
+                        llm_found_submit = "submit_pressed"
+                    except:
+                        llm_found_submit = "submit_not_found"
+            
+            # Check if LLM provided a finding in step 4
+            # (In a real run, step 4 results might have already updated llm_found_submit if we parsed it)
+
+            final_data = {"questions": prepopulated_map, "llm_found_submit": llm_found_submit}
+            details_json = json.dumps(final_data)
+
+            # Step 6: Write final populated app back to application_schema (human readable audit)
+            conn = get_connection()
+            conn.execute("UPDATE jobs SET application_schema = ? WHERE url = ?", (details_json, job["url"]))
+            conn.commit()
+
+            if llm_found_submit == "submit_pressed":
+                success_indicators = ["thank you", "received", "submitted", "confirmation"]
                 content = page.content().lower()
                 if any(ind in content for ind in success_indicators):
                     add_event(f"[W{worker_id}] APPLIED: Success indicator found.")
                     update_state(worker_id, status="applied", last_action="Applied!")
-                    return "applied", duration_ms, details_json
+                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
                 else:
                     add_event(f"[W{worker_id}] Warning: No clear success message found.")
-                    return "applied", duration_ms, details_json
+                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
             else:
-                add_event(f"[W{worker_id}] FAILED: Could not find submit button.")
-                return "failed:no_submit_button", duration_ms, details_json
+                if dry_run:
+                    add_event(f"[W{worker_id}] DRY RUN: {llm_found_submit}")
+                    update_state(worker_id, status="applied", last_action="DRY RUN OK")
+                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
+                else:
+                    add_event(f"[W{worker_id}] FAILED: Could not find/press submit button.")
+                    return "failed:no_submit_button", duration_ms, details_json, json.dumps(prepopulated_map)
 
         except Exception as e:
             logger.exception("Apply error")
             duration_ms = int((time.time() - start) * 1000)
-            return f"failed:{str(e)[:100]}", duration_ms, json.dumps(application_details)
+            final_data = {"questions": prepopulated_map, "llm_found_submit": "error_occurred"}
+            return f"failed:{str(e)[:100]}", duration_ms, json.dumps(final_data), json.dumps(prepopulated_map)
         finally:
             pass
 
@@ -546,7 +746,7 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None]:
+            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
     """Execute a job application session."""
     return run_job_gemini(job, port, worker_id, model=model, dry_run=dry_run)
 
@@ -640,7 +840,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms, details_json = run_job(job, port=port, worker_id=worker_id,
+            result, duration_ms, details_json, prepop_json = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
             
             # Update cumulative cost from LLM client
@@ -652,7 +852,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms, application_details=details_json)
+                mark_result(job["url"], "applied", duration_ms=duration_ms, 
+                           application_details=details_json,
+                           application_prepopulated=prepop_json)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
@@ -661,7 +863,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms,
-                            application_details=details_json)
+                            application_details=details_json,
+                            application_prepopulated=prepop_json)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

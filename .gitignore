@@ -7,6 +7,8 @@ resume.pdf
 !.env.example
 *.lnk
 */archive.lnk*
+brex_postpopulated.JSON
+brex_prepopulated.JSON
 
 # Runtime artifacts
 *.db
@@ -45,3 +47,4 @@ Thumbs.db
 
 # Python Env
 venv
+

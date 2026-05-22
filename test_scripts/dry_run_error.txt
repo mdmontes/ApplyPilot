@@ -1,0 +1,11 @@
+17:27:12 - ERROR - Apply error
+Traceback (most recent call last):
+  File "C:\Repos\C_ApplyPilot\ApplyPilot\src\applypilot\apply\launcher.py", line 463, in run_job_gemini
+    page.goto(url, wait_until="networkidle", timeout=60000)
+  File "C:\Repos\C_ApplyPilot\ApplyPilot\venv\Lib\site-packages\playwright\sync_api\_generated.py", line 9362, in goto
+    self._sync(
+  File "C:\Repos\C_ApplyPilot\ApplyPilot\venv\Lib\site-packages\playwright\_impl\_sync_base.py", line 115, in _sync
+    return task.result()
+           ^^^^^^^^^^^^^
+  File "C:\Repos\C_ApplyPilot\ApplyPilot\venv\Lib\site-packages\playwright\_impl\_page.py", line 552, in goto
+    return await self._main_frame.goto(**locals_to_params(locals()))

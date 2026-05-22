@@ -132,7 +132,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
             verification_confidence TEXT,
-            application_details   TEXT
+            application_details   TEXT,
+            application_prepopulated TEXT
         )
     """)
     conn.commit()
@@ -186,6 +187,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
     "application_details": "TEXT",
+    "application_prepopulated": "TEXT",
 }
 
 
@@ -436,7 +438,7 @@ def validate_and_load_custom_sql() -> str | None:
         
         sample = sample_rows[0]
         cols = sample.keys()
-        required = ["url", "title", "site", "application_url", "fit_score", "location", "full_description"]
+        required = ["url", "title", "site", "application_url", "fit_score", "location", "full_description", "application_schema"]
         missing = [c for c in required if c not in cols]
         if missing:
             console.print(f"[red]Custom SQL missing required columns:[/red] {', '.join(missing)}")

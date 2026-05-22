@@ -120,16 +120,20 @@ def run_scoring(limit: int = 0, force: bool = False, custom_sql: str | None = No
 
     if custom_sql:
         query = f"WITH custom_subset AS ({custom_sql}) SELECT * FROM custom_subset WHERE full_description IS NOT NULL"
+        params = []
         if not force:
             query += " AND fit_score IS NULL"
         if limit > 0:
-            query += f" LIMIT {limit}"
-        jobs = conn.execute(query).fetchall()
+            query += " LIMIT ?"
+            params.append(limit)
+        jobs = conn.execute(query, params).fetchall()
     elif force:
         query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        params = []
         if limit > 0:
-            query += f" LIMIT {limit}"
-        jobs = conn.execute(query).fetchall()
+            query += " LIMIT ?"
+            params.append(limit)
+        jobs = conn.execute(query, params).fetchall()
     else:
         jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
 
