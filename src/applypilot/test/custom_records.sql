@@ -1,1 +1,1 @@
-Select * from jobs where site in ('brex')
+Select * from jobs where site in ('brex', 'andurilindustries', 'capitaltg', 'cookunity', 'cookunity', 'crunchyroll', 'databricks', 'figma','m1technology','nebius', 'neuralink', 'octave', 'ayahealthcare', 'bankrate', 'catonetworks', 'coupang', 'datavant', 'esri', 'lob', 'nexhealth', 'orennia', 'rdccareers', 'qventus', 'redventures', 'riotgames', 'roblox', 'route', 'samsara','storable', 'unity', 'zoominfo')

@@ -113,26 +113,25 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                            fit_score, location, full_description,
                            application_schema
                     FROM custom_subset
-                    WHERE (apply_status IS NULL OR apply_status = 'failed')
-                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                    WHERE apply_status IS NULL
                       AND fit_score >= ?
                       AND application_url IS NOT NULL
                     ORDER BY fit_score DESC, url
                     LIMIT 1
                 """
+                row = conn.execute(query, [min_score]).fetchone()
             else:
                 query = """
                     SELECT url, title, site, application_url,
                            fit_score, location, full_description,
                            application_schema
                     FROM jobs
-                    WHERE (apply_status IS NULL OR apply_status = 'failed')
-                      AND (apply_attempts IS NULL OR apply_attempts < ?)
+                    WHERE apply_status IS NULL
                       AND fit_score >= ?
                     ORDER BY fit_score DESC, url
                     LIMIT 1
                 """
-            row = conn.execute(query, [config.DEFAULTS["max_apply_attempts"], min_score]).fetchone()
+                row = conn.execute(query, [min_score]).fetchone()
 
         if not row:
             conn.rollback()
@@ -166,7 +165,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 
 def mark_result(url: str, status: str, error: str | None = None,
-                permanent: bool = False, duration_ms: int | None = None,
+                duration_ms: int | None = None,
                 task_id: str | None = None,
                 application_details: str | None = None,
                 application_prepopulated: str | None = None) -> None:
@@ -183,24 +182,15 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (now, duration_ms, task_id, application_details, application_prepopulated, url))
     else:
-        if permanent:
-            conn.execute("""
-                UPDATE jobs SET apply_status = ?, apply_error = ?,
-                               apply_attempts = 99, agent_id = NULL,
-                               apply_duration_ms = ?, apply_task_id = ?,
-                               application_details = ?,
-                               application_prepopulated = ?
-                WHERE url = ?
-            """, (status, error or "unknown", duration_ms, task_id, application_details, application_prepopulated, url))
-        else:
-            conn.execute("""
-                UPDATE jobs SET apply_status = ?, apply_error = ?,
-                               apply_attempts = COALESCE(apply_attempts, 0) + 1, agent_id = NULL,
-                               apply_duration_ms = ?, apply_task_id = ?,
-                               application_details = ?,
-                               application_prepopulated = ?
-                WHERE url = ?
-            """, (status, error or "unknown", duration_ms, task_id, application_details, application_prepopulated, url))
+        # All failures are now treated as final (no retries)
+        conn.execute("""
+            UPDATE jobs SET apply_status = ?, apply_error = ?,
+                           apply_attempts = 99, agent_id = NULL,
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           application_details = ?,
+                           application_prepopulated = ?
+            WHERE url = ?
+        """, (status, error or "unknown", duration_ms, task_id, application_details, application_prepopulated, url))
     conn.commit()
 
 
@@ -752,32 +742,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
 
 # ---------------------------------------------------------------------------
-# Permanent failure classification
-# ---------------------------------------------------------------------------
-
-PERMANENT_FAILURES: set[str] = {
-    "expired", "captcha", "login_issue",
-    "not_eligible_location", "not_eligible_salary",
-    "already_applied", "account_required",
-    "not_a_job_application", "unsafe_permissions",
-    "unsafe_verification", "sso_required",
-    "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
-}
-
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
-
-
-def _is_permanent_failure(result: str) -> bool:
-    """Determine if a failure should never be retried."""
-    reason = result.split(":", 1)[-1] if ":" in result else result
-    return (
-        result in PERMANENT_FAILURES
-        or reason in PERMANENT_FAILURES
-        or any(reason.startswith(p) for p in PERMANENT_PREFIXES)
-    )
-
-
-# ---------------------------------------------------------------------------
 # Worker loop
 # ---------------------------------------------------------------------------
 
@@ -861,7 +825,6 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms,
                             application_details=details_json,
                             application_prepopulated=prepop_json)
