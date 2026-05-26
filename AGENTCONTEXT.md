@@ -20,7 +20,7 @@ src/applypilot/
 ├── apply/
 │   ├── chrome.py          # Manages Chrome browser instances and profiles for automation.
 │   ├── dashboard.py       # Rich terminal dashboard for tracking real-time apply progress.
-│   ├── launcher.py        # Orchestrator for the apply pipeline, supports Gemini and Claude Code engines.
+│   ├── launcher.py        # Orchestrator for the apply pipeline, using Gemini.
 │   └── prompt.py          # Builds instructions for autonomous agents to fill forms using profile data.
 ├── config/
 │   ├── employers.yaml     # Registry of preconfigured Workday employer portals.
@@ -39,7 +39,7 @@ src/applypilot/
 ├── cli.py                 # Typer-based CLI entry point defining all user-facing commands.
 ├── config.py              # Centralized configuration, environment loading, and path management.
 ├── database.py            # SQLite database layer, schema definitions, and migration logic.
-├── llm.py                 # Unified interface for LLM providers (Gemini, OpenAI, Local).
+├── llm.py                 # Unified interface for Gemini.
 ├── pipeline.py            # Main orchestrator managing sequential or streaming execution of stages.
 └── view.py                # Generates the self-contained HTML results dashboard.
 ```
@@ -64,7 +64,7 @@ src/applypilot/
 ### 4. Apply
 - **Purpose**: Autonomously submit the job application.
 - **Executed Files**: `apply/launcher.py`, `apply/chrome.py`, `apply/prompt.py`.
-- **Workflow**: Acquires high-scoring jobs. Launches an isolated Chrome instance. Uses the Gemini Engine (or Claude Code) to analyze the form, map profile data to fields, and execute the submission.
+- **Workflow**: Acquires high-scoring jobs. Launches an isolated Chrome instance. Uses the Gemini Engine to analyze the form, map profile data to fields, and execute the submission.
 
 ## SQLite Database & Stage Gating
 
@@ -108,6 +108,6 @@ The pipeline uses specific columns to "gate" jobs between stages. These gates ca
 As an AI agent operating within this workspace, my capabilities and limitations are defined as follows:
 
 1. **Explicit Approval Requirement**: I operate primarily in **Plan Mode**, which means I cannot modify source code without first proposing a strategy and obtaining explicit user approval.
-2. **Interactive Automation Constraints**: I am unable to interactively execute or debug the browser-based automation tools (Claude Code/Chrome) in real-time. My visibility into the `Auto-Apply` stage is limited to code analysis and logs, as I cannot "see" or interact with the browser sessions directly.
+2. **Interactive Automation Constraints**: I am unable to interactively execute or debug the browser-based automation tools (Chrome) in real-time. My visibility into the `Auto-Apply` stage is limited to code analysis and logs, as I cannot "see" or interact with the browser sessions directly.
 3. **Sandbox Testing**: I cannot easily test features that require external network access to private portals or specialized local environments (like a specific version of Chrome or Node.js) unless automated test suites are provided.
 4. **Environment Configuration**: I depend on the existence of valid `.env`, `profile.json`, and `searches.yaml` files for runtime simulation, and I must treat these sensitive files with high security priority.

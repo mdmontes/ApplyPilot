@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import typer
@@ -10,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from applypilot import __version__
+from applypilot.config import DEFAULTS as CONFIG_DEFAULTS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,12 +138,12 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Maximum number of applications to submit in this session."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers to spawn."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score (1-10) required for a job to be eligible for auto-apply."),
-    model: str = typer.Option("gemini-2.0-flash", "--model", "-m", help="Gemini model to use for surgical form-filling fallbacks."),
+    model: str = typer.Option(CONFIG_DEFAULTS["model_gemini"], "--model", "-m", help="Gemini model to use for surgical form-filling fallbacks."),
     continuous: bool = typer.Option(False, "--continuous", "-C", help="Run in continuous mode, polling the database for new high-scoring jobs indefinitely."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate applications: populate form fields and log details without clicking 'Submit'."),
     headless: bool = typer.Option(True, "--headless/--no-headless", help="Run browsers in headless mode (default). Set to --no-headless to see the automation."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL, ignoring the database queue."),
-    gen: bool = typer.Option(False, "--gen", help="Generate a prompt file and MCP config for manual debugging with the Claude/Gemini CLI."),
+    gen: bool = typer.Option(False, "--gen", help="Generate a prompt file and MCP config for manual debugging with the Gemini CLI."),
     custom: bool = typer.Option(False, "--custom", "-c", help="Only apply to the subset of jobs defined in src/applypilot/test/custom_records.sql."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark the specified job URL as 'applied' in the database."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark the specified job URL as 'failed' (requires --fail-reason)."),
@@ -224,7 +226,7 @@ def apply(
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  gemini-cli --model {model} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -376,18 +378,11 @@ def doctor() -> None:
     # --- Tier 2 checks ---
     import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
     if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+        model = os.environ.get("LLM_MODEL", CONFIG_DEFAULTS["model_gemini"])
+        results.append(("Gemini API key", ok_mark, f"Active ({model})"))
     else:
-        results.append(("LLM API key", fail_mark,
+        results.append(("Gemini API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks (Optional/Manual) ---
@@ -399,7 +394,7 @@ def doctor() -> None:
         results.append(("Chrome/Chromium", fail_mark,
                         "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
 
-    # Node.js / npx (for Playwright MCP - still useful for other things maybe, but let's keep it as optional)
+    # Node.js / npx
     npx_bin = shutil.which("npx")
     if npx_bin:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
@@ -432,9 +427,9 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters, and auto-apply (needs LLM API key + Chrome)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters, and auto-apply (needs Gemini API key)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 2 satisfies all current requirements.[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: Full Auto-Apply (needs Chrome/Chromium)[/dim]")
 
     console.print()
 

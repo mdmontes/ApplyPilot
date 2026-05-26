@@ -209,7 +209,7 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
+               model: str = config.DEFAULTS["model_gemini"], worker_id: int = 0) -> Path | None:
     """Generate a prompt file and print the Gemini CLI command for manual debugging.
 
     Returns:
@@ -420,11 +420,109 @@ def reset_failed() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Submission Validation Helpers
+# ---------------------------------------------------------------------------
+
+def detect_validation_errors(page) -> list[str]:
+    """Scrapes visible validation errors from the page (Greenhouse focus)."""
+    return page.evaluate("""() => {
+        let found = [];
+        
+        // 1. Greenhouse specific: elements with id ending in -error
+        document.querySelectorAll('[id$="-error"]').forEach(el => {
+            const text = el.innerText.trim();
+            if (text) {
+                const fieldId = el.id.replace('-error', '');
+                const labelEl = document.querySelector(`label[for="${fieldId}"]`);
+                const label = labelEl ? labelEl.innerText.trim() : 'Unknown Field';
+                found.push(`Field "${label}" (ID: ${fieldId}) error: ${text}`);
+            }
+        });
+
+        // 2. Greenhouse specific: li.error containers
+        document.querySelectorAll('li.error').forEach(li => {
+            const labelEl = li.querySelector('label');
+            const label = labelEl ? labelEl.innerText.trim() : 'Unknown Field';
+            const msgEl = li.querySelector('.error-message, .required-message, .required-error');
+            const msg = msgEl ? msgEl.innerText.trim() : 'is required or invalid';
+            const input = li.querySelector('input, select, textarea');
+            found.push(`Field "${label}" (ID: ${input ? input.id : 'unknown'}) error: ${msg}`);
+        });
+
+        // 3. Generic invalid fields (browser level)
+        document.querySelectorAll('input:invalid, select:invalid, textarea:invalid').forEach(el => {
+            const labelEl = document.querySelector(`label[for="${el.id}"]`);
+            const label = labelEl ? labelEl.innerText.trim() : 'Unknown Field';
+            found.push(`Field "${label}" (ID: ${el.id}) is browser-marked as invalid or missing.`);
+        });
+
+        // 4. Aria-invalid fields
+        document.querySelectorAll('[aria-invalid="true"]').forEach(el => {
+            const labelEl = document.querySelector(`label[for="${el.id}"]`);
+            const label = labelEl ? labelEl.innerText.trim() : 'Unknown Field';
+            found.push(`Field "${label}" (ID: ${el.id}) is aria-marked as invalid.`);
+        });
+
+        return Array.from(new Set(found));
+    }""")
+
+
+def detect_success(page, initial_url: str | None = None) -> bool:
+    """Checks if the page indicates a successful submission.
+    
+    Strictly focuses on Greenhouse patterns and URL redirects.
+    """
+    current_url = page.url.lower()
+    initial_url = (initial_url or "").lower()
+    
+    # 1. URL Change to Confirmation (Strongest Signal)
+    if "/confirmation" in current_url or "/thank-you" in current_url:
+        if initial_url and initial_url in current_url and "/confirmation" not in initial_url:
+            return True
+        elif not initial_url:
+            return True
+
+    # 2. Specific Greenhouse Success Elements
+    success_elements = [
+        "#application_confirmation",
+        ".thank-you-message",
+        "h1:has-text('Application Submitted')",
+        "h1:has-text('Thank you for applying')",
+        ".confirmation-page"
+    ]
+    for sel in success_elements:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except:
+            continue
+
+    # 3. Disappearance of Form + Success Keywords
+    # Only if the form was there and is now gone
+    form_selectors = ["#application_form", "#main-form", ".job-application-form"]
+    form_exists = False
+    for sel in form_selectors:
+        if page.locator(sel).count() > 0:
+            form_exists = True
+            break
+            
+    if not form_exists:
+        success_indicators = ["application submitted", "received your application", "thank you for your application"]
+        content = page.content().lower()
+        if any(ind in content for ind in success_indicators):
+            # Ensure it's not the generic "thank you for your interest"
+            if "thank you for your interest" not in content or "submitted" in content:
+                return True
+            
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Per-job execution (Gemini Engine)
 # ---------------------------------------------------------------------------
 
 def run_job_gemini(job: dict, port: int, worker_id: int = 0,
-                    model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
+                    model: str = config.DEFAULTS["model_gemini"], dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
     """Execute a one-shot job application using Prepopulated-Schema + Gemini fallback."""
     start = time.time()
     
@@ -452,7 +550,7 @@ def run_job_gemini(job: dict, port: int, worker_id: int = 0,
         conn.commit()
 
         # Activate LLM check
-        prepopulated_map = check_prepopulated_app(job, profile, prepopulated_map)
+        prepopulated_map = check_prepopulated_app(job, profile, prepopulated_map, model=model)
         
         # Save verified prepopulated map to database (pre-apply state)
         conn.execute(
@@ -621,7 +719,7 @@ Criteria for "TOO_COMPLEX":
 
 Respond with ONLY "OK" or "TOO_COMPLEX".
 """
-                complexity_resp = llm.ask(complexity_prompt).strip().upper()
+                complexity_resp = llm.ask(complexity_prompt, model=model).strip().upper()
                 if "TOO_COMPLEX" in complexity_resp:
                     add_event(f"[W{worker_id}] ABORT: Form too complex (>15s estimate)")
                     final_data = {"questions": prepopulated_map, "llm_found_submit": "aborted_too_complex"}
@@ -629,7 +727,7 @@ Respond with ONLY "OK" or "TOO_COMPLEX".
 
                 # Surgical Fill
                 prompt = prompt_mod.build_gemini_fill_prompt(job, fallback_structure)
-                response = llm.ask(prompt)
+                response = llm.ask(prompt, model=model)
                 
                 try:
                     json_str = response.strip()
@@ -677,55 +775,142 @@ Respond with ONLY "OK" or "TOO_COMPLEX".
                 except:
                     pass
 
-            # 5. Submit Tracking
-            duration_ms = int((time.time() - start) * 1000)
+            # 5. Submit & Verify Loop
             llm_found_submit = "submit_not_found"
-            submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']")
+            submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']") or page.query_selector("input[type='submit']")
+            
+            if not submit_btn:
+                # Last ditch effort: search for anything that looks like a submit button
+                submit_btn = page.evaluate_handle("""() => {
+                    const btns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
+                    return btns.find(b => {
+                        const text = (b.innerText || b.value || '').toLowerCase();
+                        return text.includes('submit') || text.includes('apply') || text.includes('finish');
+                    });
+                }""")
+                if not submit_btn.as_element():
+                    submit_btn = None
+
             if submit_btn:
                 if dry_run:
                     llm_found_submit = "submit_found_not_pressed"
+                    add_event(f"[W{worker_id}] DRY RUN: Found submit button.")
                 else:
-                    try:
-                        submit_btn.click()
-                        page.wait_for_timeout(5000)
-                        llm_found_submit = "submit_pressed"
-                    except:
-                        llm_found_submit = "submit_not_found"
-            
-            # Check if LLM provided a finding in step 4
-            # (In a real run, step 4 results might have already updated llm_found_submit if we parsed it)
+                    llm_found_submit = "submit_pressed"
+                    add_event(f"[W{worker_id}] Clicking Submit...")
+                    submit_btn.click()
+                    
+                    # 15-second verification loop
+                    for attempt in range(15):
+                        page.wait_for_timeout(1000)
+                        
+                        if detect_success(page, initial_url=url):
+                            add_event(f"[W{worker_id}] APPLIED: Success confirmed!")
+                            break
+                        
+                        errors = detect_validation_errors(page)
+                        if errors:
+                            add_event(f"[W{worker_id}] SUBMISSION FAILED: {len(errors)} validation errors found.")
+                            
+                            # CORRECTION COMPLEXITY CHECK
+                            error_ctx = "\n".join([f"- {e}" for e in errors])
+                            complexity_prompt = f"""You are an autonomous application agent. 
+Analyze the following validation errors detected on a job application page after clicking submit.
+Determine if accurately correcting these specific errors would take longer than 20 seconds.
 
-            final_data = {"questions": prepopulated_map, "llm_found_submit": llm_found_submit}
+ERRORS TO FIX:
+{error_ctx}
+
+Respond with ONLY "OK" or "TOO_COMPLEX".
+"""
+                            complexity_resp = llm.ask(complexity_prompt, model=model).strip().upper()
+                            if "TOO_COMPLEX" in complexity_resp:
+                                add_event(f"[W{worker_id}] ABORT: Correction too complex (>20s estimate)")
+                                llm_found_submit = f"aborted_too_complex: {', '.join(errors)[:100]}"
+                                break
+
+                            # ATTEMPT FIX
+                            update_state(worker_id, last_action="Correcting form errors", actions=3)
+                            fix_prompt = prompt_mod.build_gemini_fix_errors_prompt(job, error_ctx)
+                            fix_resp = llm.ask(fix_prompt, model=model)
+                            
+                            try:
+                                json_str = fix_resp.strip()
+                                if "```json" in json_str:
+                                    json_str = json_str.split("```json")[1].split("```")[0].strip()
+                                fix_map = json.loads(json_str)
+                                
+                                for fid, data in fix_map.items():
+                                    val = data.get("value")
+                                    # Try to find by ID or Name
+                                    el = page.query_selector(f'[id="{fid}"]') or page.query_selector(f'[name="{fid}"]')
+                                    if el:
+                                        el.scroll_into_view_if_needed()
+                                        el.fill(str(val))
+                                        add_event(f"[W{worker_id}] Corrected field: {fid}")
+                                
+                                # Re-click Submit after fixing
+                                add_event(f"[W{worker_id}] Retrying submission...")
+                                submit_btn = page.query_selector("#submit_app") or page.query_selector("button[type='submit']") or page.query_selector("input[type='submit']")
+                                if submit_btn:
+                                    submit_btn.click()
+                                    continue # Back to top of loop to wait again
+                                else:
+                                    add_event(f"[W{worker_id}] FAILED: Submit button lost after correction.")
+                                    break
+                            except Exception as fe:
+                                logger.warning("Failed to parse or apply correction: %s", fe)
+                                break 
+                    
+                    # Post-loop final check
+                    if detect_success(page, initial_url=url):
+                        llm_found_submit = "submit_pressed_success"
+                    else:
+                        errors = detect_validation_errors(page)
+                        if errors:
+                            llm_found_submit = f"failed_validation: {', '.join(errors)[:100]}"
+                        else:
+                            # Check if the submit button is still visible and enabled
+                            is_visible = page.evaluate("(btn) => btn && btn.offsetParent !== null && !btn.disabled", submit_btn)
+                            if is_visible:
+                                llm_found_submit = "failed_submission_stuck: Button still visible/enabled after click"
+                            else:
+                                llm_found_submit = "failed_timeout_or_no_response"
+
+            # 6. Final State Capture & Database Update
+            duration_ms = int((time.time() - start) * 1000)
+            final_data = {
+                "questions": prepopulated_map,
+                "llm_found_submit": llm_found_submit,
+                "final_url": page.url,
+                "browser_context": {
+                    "url": page.url,
+                    "title": page.title(),
+                    "errors_detected": detect_validation_errors(page)
+                }
+            }
             details_json = json.dumps(final_data)
 
-            # Step 6: Write final populated app back to application_schema (human readable audit)
+            # Update application_schema with audit log
             conn = get_connection()
             conn.execute("UPDATE jobs SET application_schema = ? WHERE url = ?", (details_json, job["url"]))
             conn.commit()
 
-            if llm_found_submit == "submit_pressed":
-                success_indicators = ["thank you", "received", "submitted", "confirmation"]
-                content = page.content().lower()
-                if any(ind in content for ind in success_indicators):
-                    add_event(f"[W{worker_id}] APPLIED: Success indicator found.")
-                    update_state(worker_id, status="applied", last_action="Applied!")
-                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
-                else:
-                    add_event(f"[W{worker_id}] Warning: No clear success message found.")
-                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
+            if llm_found_submit == "submit_pressed_success":
+                update_state(worker_id, status="applied", last_action="Applied!")
+                return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
+            elif dry_run and llm_found_submit == "submit_found_not_pressed":
+                update_state(worker_id, status="applied", last_action="DRY RUN OK")
+                return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
             else:
-                if dry_run:
-                    add_event(f"[W{worker_id}] DRY RUN: {llm_found_submit}")
-                    update_state(worker_id, status="applied", last_action="DRY RUN OK")
-                    return "applied", duration_ms, details_json, json.dumps(prepopulated_map)
-                else:
-                    add_event(f"[W{worker_id}] FAILED: Could not find/press submit button.")
-                    return "failed:no_submit_button", duration_ms, details_json, json.dumps(prepopulated_map)
+                reason = llm_found_submit if ":" in llm_found_submit else f"failed:{llm_found_submit}"
+                add_event(f"[W{worker_id}] FAILED: {reason}")
+                return reason, duration_ms, details_json, json.dumps(prepopulated_map)
 
         except Exception as e:
             logger.exception("Apply error")
             duration_ms = int((time.time() - start) * 1000)
-            final_data = {"questions": prepopulated_map, "llm_found_submit": "error_occurred"}
+            final_data = {"questions": prepopulated_map, "llm_found_submit": "error_occurred", "error": str(e)}
             return f"failed:{str(e)[:100]}", duration_ms, json.dumps(final_data), json.dumps(prepopulated_map)
         finally:
             pass
@@ -736,7 +921,7 @@ Respond with ONLY "OK" or "TOO_COMPLEX".
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "gemini-2.0-flash", dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
+            model: str = config.DEFAULTS["model_gemini"], dry_run: bool = False) -> tuple[str, int, str | None, str | None]:
     """Execute a job application session."""
     return run_job_gemini(job, port, worker_id, model=model, dry_run=dry_run)
 
@@ -748,7 +933,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False,
+                model: str = config.DEFAULTS["model_gemini"], dry_run: bool = False,
                 custom_sql: str | None = None,
                 continuous: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
@@ -861,7 +1046,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = True, model: str = "sonnet",
+         min_score: int = 7, headless: bool = True, model: str = config.DEFAULTS["model_gemini"],
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1, custom: bool = False,
          custom_sql: str | None = None) -> None:

@@ -9,6 +9,8 @@ resume.pdf
 */archive.lnk*
 brex_postpopulated.JSON
 brex_prepopulated.JSON
+adurindustries_postpopulated.JSON
+qventus_postpopulated.JSON
 
 # Runtime artifacts
 *.db

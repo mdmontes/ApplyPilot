@@ -192,41 +192,31 @@ def _setup_profile() -> dict:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Ask about AI scoring/tailoring — strictly Gemini configuration."""
     console.print(Panel(
         "[bold]Step 3: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
+        "A Gemini LLM powers job scoring, resume tailoring, and auto-apply surgical filling.\n"
+        "Without this, you can only discover and enrich jobs."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
-        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
+    if not Confirm.ask("Enable AI scoring and auto-apply logic?", default=True):
+        console.print("[dim]Discovery-only mode. You can configure Gemini later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
-    provider = Prompt.ask(
-        "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
-    )
+    console.print("Get a free API key at: [bold blue]https://aistudio.google.com[/bold blue]")
+    api_key = Prompt.ask("Gemini API key").strip()
+    model = Prompt.ask("Gemini Model", default="gemini-2.5-flash")
 
     env_lines = ["# ApplyPilot configuration", ""]
+    env_lines.append(f"GEMINI_API_KEY={api_key}")
+    env_lines.append(f"LLM_MODEL={model}")
 
-    if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-flash-latest")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
-        model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
+    # Preserve any existing CapSolver key if present
+    if ENV_PATH.exists():
+        existing = ENV_PATH.read_text(encoding="utf-8")
+        for line in existing.splitlines():
+            if line.startswith("CAPSOLVER_API_KEY="):
+                env_lines.append(line)
 
     env_lines.append("")
     ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
@@ -238,31 +228,33 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires Chrome)."""
     console.print(Panel(
         "[bold]Step 4: Auto-Apply (optional)[/bold]\n"
-        "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "ApplyPilot autonomously fills and submits job applications\n"
+        "using Chrome and Gemini-powered surgical form filling."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
-        console.print("[green]Claude Code CLI detected.[/green]")
-    else:
+    # Check for Chrome
+    from applypilot.config import get_chrome_path
+    try:
+        chrome_path = get_chrome_path()
+        console.print(f"[green]Chrome detected at {chrome_path}[/green]")
+    except FileNotFoundError:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]Chrome/Chromium not found.[/yellow]\n"
+            "Install Chrome or set CHROME_PATH in your environment.\n"
+            "Auto-apply won't work without a browser."
         )
 
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
     if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
+        capsolver_key = Prompt.ask("CapSolver API key").strip()
         # Append to existing .env or create
         if ENV_PATH.exists():
             existing = ENV_PATH.read_text(encoding="utf-8")
@@ -310,7 +302,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 4: Auto-apply (Claude Code detection)
+    # Step 4: Auto-apply (Chrome detection)
     _setup_auto_apply()
     console.print()
 
@@ -332,9 +324,9 @@ def run_wizard() -> None:
 
     unlock_hint = ""
     if tier == 1:
-        unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 2: configure a Gemini API key (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install Chrome/Chromium and ensure it's on your PATH.[/dim]"
 
     console.print(
         Panel.fit(

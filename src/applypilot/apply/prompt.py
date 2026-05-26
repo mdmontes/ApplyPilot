@@ -1,6 +1,6 @@
 """Prompt builder for the autonomous job application agent.
 
-Constructs the full instruction prompt that tells Claude Code / the AI agent
+Constructs the full instruction prompt that tells the AI agent
 how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
@@ -159,8 +159,10 @@ Company: {job.get('site', 'Unknown')}
 3. Use the browser_fill tool to insert the candidate's exact profile data into these fields.
 4. For the Resume upload, use browser_file_upload with this path: {pdf_path}
 5. Scroll to the bottom to look for custom questions or EEOC dropdowns (Asterisks * indicate required).
-6. If there is a required question you do not know the answer to, deduce it from the profile/resume or enter "N/A".
-7. {submit_instruction}
+6. ALWAYS provide the LinkedIn profile link if requested, even if it is not marked as required.
+7. ALWAYS provide the GitHub profile link if a GitHub, Website, Portfolio, or any other personal link is requested, even if it is not marked as required.
+8. If there is a required question you do not know the answer to, deduce it from the profile/resume or enter "N/A".
+9. {submit_instruction}
 
 {captcha_section}
 
@@ -202,7 +204,7 @@ Company: {job.get('site', 'Unknown')}
 1. MANDATORY FIRST STEP: Identify the submission button in the form structure. If you cannot find a way to submit the form, do not attempt to map any fields; instead, return a JSON object with only the "llm_found_submit": "submit_not_found" key.
 2. Carefully analyze the form structure provided.
 3. For each relevant field (input, select, textarea), determine the best value from the candidate's profile.
-4. For standard questions (First Name, Email, Phone, LinkedIn, GitHub, Website), map them accurately.
+4. For standard questions (First Name, Email, Phone, LinkedIn, GitHub, Website), map them accurately. ALWAYS include the LinkedIn profile link if requested, even if it is marked as optional. ALWAYS include the GitHub profile link if a GitHub, Website, Portfolio, or other personal link is requested, even if it is marked as optional.
 5. For Work Authorization, EEOC (Gender, Race, Veteran, Disability), and Clearance questions, use the profile to provide honest and consistent answers.
 6. For the resume upload field (usually id="resume" or type="file"), use the string "PDF_RESUME_UPLOAD" as the value.
 7. VERY IMPORTANT: NEVER provide a value or mapping for "Cover Letter" fields. They should always be ignored.
@@ -239,6 +241,53 @@ Example output:
   "question_123": {{
     "value": "Yes",
     "label": "Are you legally authorized to work in the US?"
+  }}
+}}
+"""
+    return prompt
+
+
+def build_gemini_fix_errors_prompt(job: dict, error_context: str) -> str:
+    """Build a prompt for Gemini to fix specific form validation errors.
+
+    Args:
+        job: Job dict from the database.
+        error_context: A description of the validation errors detected on the page.
+    """
+    profile = config.load_profile()
+    profile_summary = _build_profile_summary(profile)
+
+    prompt = f"""You are an expert at troubleshooting job applications. 
+An application attempt for the following job failed due to validation errors.
+Your goal is to provide the corrected values for ONLY the fields that failed.
+
+== CANDIDATE PROFILE ==
+{profile_summary}
+
+== JOB ==
+Title: {job['title']}
+Company: {job.get('site', 'Unknown')}
+
+== VALIDATION ERRORS DETECTED ==
+{error_context}
+
+== INSTRUCTIONS ==
+1. Carefully analyze the validation errors provided.
+2. For each field mentioned in the errors, determine the correct value from the candidate's profile.
+3. If an error says a field "is required", provide a sensible default if the profile doesn't have it (e.g. "N/A", "0").
+4. If an error says a field "is invalid", try a different format (e.g. phone number with or without dashes).
+5. NEVER provide mappings for "Cover Letter" fields.
+6. Return a JSON object where keys are the HTML element IDs or names associated with the errors, and values are nested objects containing "value" and "label".
+
+Example output:
+{{
+  "question_456": {{
+    "value": "Yes",
+    "label": "Are you authorized to work in the US?"
+  }},
+  "phone": {{
+    "value": "5551234567",
+    "label": "Phone Number"
   }}
 }}
 """
